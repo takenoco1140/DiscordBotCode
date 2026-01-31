@@ -3074,6 +3074,11 @@ async def _delete_messages_after_anchor(thread: discord.Thread, anchor_id: int, 
         except Exception:
             pass
 
+async def reissue_receipt(thread: discord.Thread, st: Dict[str, Any]):
+    """Backward-compatible alias for reissue_receipt_set."""
+    return await reissue_receipt_set(thread, st)
+
+
 async def reissue_receipt_set(thread: discord.Thread, st: Dict[str, Any]):
     """受付票を再発行する（修正確定後）。
 
@@ -3419,7 +3424,7 @@ class EditConfirmView(discord.ui.View):
 
         # 受付完了後：再発行フローでやり直す（再発行メッセージ→旧投稿削除→新受付票→再発行メッセージ削除）
         try:
-            await reissue_receipt(thread, st)
+            await reissue_receipt_set(thread, st)
         except Exception:
             # 失敗しても最低限の復帰
             try:
