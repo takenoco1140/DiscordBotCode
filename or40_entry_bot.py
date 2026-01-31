@@ -2467,7 +2467,12 @@ async def post_confirm(thread: discord.Thread):
         revision=in_edit,
     )
 
-    view: discord.ui.View = EditConfirmView() if in_edit else ConfirmView()
+        # in_edit でも、修正項目が1つも開始されていない段階は「修正を中止する」の1ボタン
+    has_mod = bool((st.get("has_modified") is True) or (edited_fields and len(edited_fields) > 0))
+    if in_edit:
+        view: discord.ui.View = EditConfirmView() if has_mod else EditStartView()
+    else:
+        view: discord.ui.View = ConfirmView()
 
     # While editing an individual field, prevent cancel-all to avoid state mismatch
     if in_edit and st.get("pending_key"):
@@ -3134,6 +3139,160 @@ class EditPickView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(EditPickSelect())
+
+
+class EditStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="修正を中止する", style=discord.ButtonStyle.danger, custom_id="edit:cancel", row=0)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        st = await ensure_thread_state(interaction)
+        if not st:
+            return
+        if interaction.user.id != st.get("owner_id"):
+            await interaction.response.send_message("この操作は本人のみ実行できます。", ephemeral=True)
+            return
+
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            return
+
+        # 既に ensure_thread_state 内で ACK 済みの場合があるため、二重応答を避ける
+        await silent_ack(interaction, ephemeral=True)
+
+        # Stop edit mode and clean up picker UI
+        st["in_edit"] = False
+        st["edit_from_index"] = None
+        await _delete_edit_picker(thread, st)
+
+        # Pre-entry: just refresh the normal confirmation
+        if st.get("status") != STATUS_ACCEPTED:
+            await post_confirm(thread)
+            try:
+                await interaction.followup.send("修正を中止しました。続けてエントリーする場合は「✨エントリーする✨」を押してください。", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        # Post-accept: cancel edit -> delete messages posted by '内容を修正する' and keep the existing receipt set
+        try:
+            anchor = st.get("receipt_anchor_msg_id")
+            if anchor:
+                await _delete_messages_after_anchor(thread, int(anchor))
+            else:
+                mids = []
+                for k in ("edit_intro_msg_id", "edit_picker_msg_id", "pending_question_msg_id"):
+                    v = st.get(k)
+                    if v:
+                        mids.append(int(v))
+                for mid in mids:
+                    try:
+                        msg = await thread.fetch_message(int(mid))
+                        await msg.delete()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Post-accept: when canceling edit, also delete the "🗂登録内容" message that was posted during edit.
+        try:
+            cmid = st.get("confirm_msg_id")
+            if cmid:
+                rset = set()
+                try:
+                    for x in (st.get("receipt_set_msg_ids") or []):
+                        if str(x).isdigit():
+                            rset.add(int(x))
+                except Exception:
+                    rset = set()
+                if int(cmid) not in rset:
+                    try:
+                        cmsg = await thread.fetch_message(int(cmid))
+                        await cmsg.delete()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # cleanup flags
+        try:
+            st.pop("edit_intro_msg_id", None)
+            st.pop("edit_picker_msg_id", None)
+            st.pop("confirm_msg_id", None)
+            st["pending_question_msg_id"] = None
+        except Exception:
+            pass
+
+        try:
+            await interaction.followup.send("修正を中止しました。", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+# =========================
+# Cancel / 受付キャンセル
+# =========================
+async def perform_cancel_entry(thread: discord.Thread, st: Dict[str, Any]):
+    """受付キャンセル確定後の処理。"""
+    user_id = int(st.get("owner_id", 0))
+    receipt_no = int(st.get("receipt_no", 0))
+    owner_name = str(st.get("owner_name", ""))
+
+    # ロール外し
+    try:
+        guild = thread.guild
+        if guild and user_id:
+            member = guild.get_member(user_id)
+            if member:
+                role = resolve_entry_accept_role(guild)
+                if role:
+                    try:
+                        await member.remove_roles(role, reason="OR40 entry canceled")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # シート status 更新
+    try:
+        ws = open_worksheet()
+        row = st.get("sheet_row")
+        if not row:
+            row = _find_row_by_receipt_and_user(ws, receipt_no, user_id)
+            st["sheet_row"] = row
+        if row:
+            update_row_answers(ws, int(row), st.get("answers", {}), STATUS_CANCELED)
+    except Exception:
+        pass
+
+    st["status"] = STATUS_CANCELED
+
+    # スレッド名変更
+    try:
+        await thread.edit(name=format_thread_title(STATUS_CANCELED, receipt_no, owner_name))
+    except Exception:
+        pass
+
+    # 通知
+    try:
+        await thread.send("エントリーのキャンセルを承りました。")
+        await thread.send("10秒後に、このスレッドは閉じられます。")
+    except Exception:
+        pass
+
+    await asyncio.sleep(10)
+
+    # 退室
+    try:
+        if thread.guild and user_id:
+            member = thread.guild.get_member(user_id)
+            if member:
+                await thread.remove_user(member)
+    except Exception:
+        pass
+
+
 
 class EditConfirmView(discord.ui.View):
     def __init__(self):
