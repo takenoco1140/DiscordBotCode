@@ -3002,23 +3002,103 @@ async def _delete_messages_after_anchor(thread: discord.Thread, anchor_id: int, 
             pass
 
 async def reissue_receipt_set(thread: discord.Thread, st: Dict[str, Any]):
+    """受付票を再発行する（修正確定後）。
+
+    Spec:
+      ① 罫線付きの再発行中メッセージを投稿（本文1行）
+      ② ①より前の Bot投稿を全削除（※スレッド初期メッセージは残す）
+      ③ 新しい受付票セットを投稿（Embed footer に更新日時(JST)を明記）
+      ④ ①のメッセージを削除
+    """
+    reissue_msg = None
+
+    # ①
     try:
-        await thread.send("ーーーーーーーーーーー\n⌛送信中･･･受付票を再発行しています\nーーーーーーーーーーー")
+        reissue_msg = await thread.send(
+            "ーーーーーーーーーーーーーーーーーーーーーー\n"
+            "⌛受付票を再発行しています。このまましばらくお待ちください。\n"
+            "ーーーーーーーーーーーーーーーーーーーーーー"
+        )
+    except Exception:
+        reissue_msg = None
+
+    # ②
+    try:
+        pivot_id = int(reissue_msg.id) if reissue_msg else 0
+        keep = set()
+        intro_id = st.get("intro_msg_id")
+        if intro_id:
+            try:
+                keep.add(int(intro_id))
+            except Exception:
+                pass
+        if pivot_id:
+            await _delete_messages_before_pivot(thread, pivot_id, keep_ids=keep, limit=300)
     except Exception:
         pass
 
-    anchor = st.get("receipt_anchor_msg_id")
-    if anchor:
-        await _delete_messages_after_anchor(thread, int(anchor))
+    # ③
+    try:
+        st["receipt_set_msg_ids"] = []
+        st.pop("receipt_anchor_msg_id", None)
+    except Exception:
+        pass
 
-    st["_receipt_footer_override"] = f"［{_now_jst_str()}　修正を受け付けました］"
-    await post_final_receipt(thread)
-    st.pop("_receipt_footer_override", None)
+    try:
+        st["_receipt_footer_override"] = f"更新日時：{_now_jst_str()}（JST）"
+    except Exception:
+        pass
 
-    st["in_edit"] = False
-    st["edit_from_index"] = None
+    try:
+        await post_final_receipt(thread)
+    except Exception:
+        pass
 
-    await post_confirm(thread)
+    try:
+        st.pop("_receipt_footer_override", None)
+    except Exception:
+        pass
+
+    # 編集状態を解除（確定後）
+    try:
+        st["in_edit"] = False
+        st["edit_from_index"] = None
+        st["pending_key"] = None
+        st["pending_question_msg_id"] = None
+    except Exception:
+        pass
+
+    # ④
+    if reissue_msg:
+        try:
+            await reissue_msg.delete()
+        except Exception:
+            pass
+
+
+async def _delete_messages_before_pivot(thread: discord.Thread, pivot_id: int, *, keep_ids: Optional[set] = None, limit: int = 200):
+    """Delete bot messages that are older than the pivot message (exclusive).
+    keep_ids: message IDs to preserve (e.g., the thread intro message).
+    """
+    keep_ids = keep_ids or set()
+    to_delete = []
+    async for msg in thread.history(limit=limit, oldest_first=True):
+        if msg.id == pivot_id:
+            break
+        if msg.id in keep_ids:
+            continue
+        try:
+            if msg.author == thread.guild.me:
+                to_delete.append(msg)
+        except Exception:
+            continue
+    # delete from newest to oldest to reduce NotFound churn
+    for msg in reversed(to_delete):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
 
 class EditPickSelect(discord.ui.Select):
     def __init__(self):
