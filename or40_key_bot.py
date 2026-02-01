@@ -2321,8 +2321,10 @@ class ReplaySubmitView(discord.ui.View):
             if isinstance(ch, discord.TextChannel):
                 try:
                     await ch.send(
-                        "運営からの連絡"
-                        f"第{self.match_no}試合のリプレイデータ提出のご協力をお願いします。"
+                        "運営からの連絡
+"
+                        f"第{self.match_no}試合のリプレイデータ提出のご協力をお願いします。
+"
                         f"（対象：{target_rank} {target_number}）"
                     )
                     # advance stage only when we actually sent
