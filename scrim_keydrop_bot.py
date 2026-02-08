@@ -22,6 +22,7 @@ import datetime
 import tempfile
 import io
 import base64
+import sqlite3
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Set, List
 
@@ -41,6 +42,11 @@ STATE_PATH = os.path.join(DATA_DIR, "scrim_state.json")
 
 RESET_HOUR_JST = 5
 RESET_MINUTE_JST = 0
+
+AUTOPOST_TODAY_PANEL = os.environ.get("SCRIM_TODAY_AUTOPOST", "1") != "0"
+AUTOPOST_HOUR_JST = int(os.environ.get("SCRIM_TODAY_POST_HOUR_JST", "17"))
+AUTOPOST_MINUTE_JST = int(os.environ.get("SCRIM_TODAY_POST_MINUTE_JST", "0"))
+
 
 TEAM_LIMITS: Dict[str, int] = {"solo": 100, "duo": 50, "trio": 33, "squad": 25}
 
@@ -63,7 +69,10 @@ _KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"  # avoid I,O only
 ACCENT_COLOR = "#0B3A96"
 
 ASSETS_DIR = r"D:\DiscordBot\assets"
+GENERATED_KEYS_DIR = os.path.join(ASSETS_DIR, "generated_keys")
 KEY_BG_PATH = os.path.join(ASSETS_DIR, "カスタムキー台紙.png")
+
+SCRIM_CALENDAR_DB_PATH = os.environ.get("SCRIM_CALENDAR_DB_PATH", r"D:\DiscordBot\bots\scrim_calendar\scrim.db")
 
 def _bg_data_url() -> str:
     try:
@@ -151,6 +160,33 @@ async def _ephemeral_reply(interaction: discord.Interaction, content: str) -> No
 # =====================
 # HTML/CSS Image Rendering (OR40-style / White BG)
 # =====================
+
+
+def _write_latest_key_images(png_bytes: bytes) -> tuple[str, str | None]:
+    """Save png to assets/generated_keys as latest.png, keeping prev.png."""
+    os.makedirs(GENERATED_KEYS_DIR, exist_ok=True)
+    latest = os.path.join(GENERATED_KEYS_DIR, "latest.png")
+    prev = os.path.join(GENERATED_KEYS_DIR, "prev.png")
+    tmp = os.path.join(GENERATED_KEYS_DIR, "latest.tmp.png")
+
+    if os.path.exists(latest):
+        try:
+            os.replace(latest, prev)
+        except Exception:
+            try:
+                import shutil
+                shutil.copy2(latest, prev)
+            except Exception:
+                pass
+
+    with open(tmp, "wb") as f:
+        f.write(png_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, latest)
+
+    return latest, (prev if os.path.exists(prev) else None)
+
 
 def _html_escape(s: str) -> str:
     return (
@@ -456,6 +492,318 @@ async def _try_render_png_from_html_key(html: str) -> Optional[bytes]:
         return None
 
 
+
+# =====================
+# Daily Scrim Panel Rendering (HTML -> PNG)  [NEW]
+# =====================
+
+def _scrim_panel_icon(style: str) -> str:
+    if style == "従来式":
+        return "🔵"
+    if style == "回転式":
+        return "🟠"
+    return ""
+
+
+def _html_esc(s: Any) -> str:
+    s = "" if s is None else str(s)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
+    )
+
+
+def _read_today_scrim_events_from_db(today_ymd: str) -> List[Dict[str, Any]]:
+    """scrim_calendar の scrim.db から、当日(date=YYYY-MM-DD)の予定を読む"""
+    db_path = SCRIM_CALENDAR_DB_PATH
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"scrim calendar DB not found: {db_path}")
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+
+    try:
+        rows = con.execute(
+            """
+            SELECT id, date, title, style, start_time, matches, mode_primary, mode_secondary, composite_json, note
+            FROM events
+            WHERE date = ?
+            ORDER BY start_time, id
+            """,
+            (today_ymd,),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        # 典型: DB未初期化で events テーブルが無い
+        msg = str(e)
+        if "no such table" in msg and "events" in msg:
+            try:
+                tbls = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            except Exception:
+                tbls = []
+            print(f"[WARN] scrim_calendar DB has no 'events' table. tables={tbls} db={db_path}")
+            rows = []
+        else:
+            con.close()
+            raise
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        comp = []
+        if r["composite_json"]:
+            try:
+                comp = json.loads(r["composite_json"])
+            except Exception:
+                comp = []
+        if not isinstance(comp, list):
+            comp = []
+
+        out.append(
+            {
+                "id": r["id"],
+                "title": r["title"] or "",
+                "style": r["style"] or "登録しない",
+                "start_time": r["start_time"] or "",
+                "matches": r["matches"],
+                "mode_primary": r["mode_primary"] or "",
+                "mode_secondary": r["mode_secondary"] or "",
+                "composite": comp,
+                "note": r["note"] or "",
+            }
+        )
+    return out
+
+
+def _build_today_panel_html(today_ymd: str, events: List[Dict[str, Any]]) -> str:
+    # date badge
+    y, m, d = map(int, today_ymd.split("-"))
+    date_badge = f"{y}/{str(m).zfill(2)}/{str(d).zfill(2)}"
+    updated = fmt_hhmm_jst(utc_now())
+
+    # KPIs
+    kpi_trad = sum(1 for e in events if e.get("style") == "従来式")
+    kpi_rot = sum(1 for e in events if e.get("style") == "回転式")
+    kpi_none = len(events) - kpi_trad - kpi_rot
+    times = sorted([e.get("start_time") for e in events if e.get("start_time")])
+    kpi_first = times[0] if times else "—"
+
+    # cards
+    cards_html = ""
+    if not events:
+        cards_html = '<div class="card"><div class="sub">本日の予定はありません</div></div>'
+    else:
+        parts = []
+        for e in events:
+            icon = _scrim_panel_icon(e.get("style", ""))
+            icon_html = f'<span class="ico">{_html_esc(icon)}</span>' if icon else '<span class="ico none">⚪</span>'
+            title = _html_esc(e.get("title", ""))
+            style = _html_esc(e.get("style", ""))
+            start_time = _html_esc(e.get("start_time", "")) or "未定"
+            mode_primary = _html_esc(e.get("mode_primary", "")) or "—"
+            mode_secondary = _html_esc(e.get("mode_secondary", "")) or "—"
+
+            match_tag = ""
+            if e.get("style") == "従来式":
+                match_tag = f'<span class="tag"><strong>試合</strong> {_html_esc(e.get("matches") or 0)}</span>'
+
+            comp_html = ""
+            if e.get("mode_secondary") == "複合" and e.get("composite"):
+                lines = []
+                for x in e.get("composite", []):
+                    if not isinstance(x, dict):
+                        continue
+                    md = _html_esc(x.get("mode", ""))
+                    try:
+                        mm = int(x.get("matches") or 0)
+                    except Exception:
+                        mm = 0
+                    if md:
+                        lines.append(f"・{md} {mm}試合")
+                if lines:
+                    comp_html = '<div class="note"><b>複合内訳</b><br>' + "<br>".join(lines) + "</div>"
+
+            note_html = ""
+            if e.get("note"):
+                note_html = f'<div class="note"><b>備考</b> {_html_esc(e.get("note"))}</div>'
+
+            parts.append(
+                f'''
+                <div class="card">
+                  <div class="row1">
+                    <div class="name">{icon_html}<span class="truncate">{title}</span></div>
+                  </div>
+                  <div class="meta">
+                    <span class="tag"><strong>開始</strong> {start_time}</span>
+                    <span class="tag"><strong>方式</strong> {style}</span>
+                    {match_tag}
+                    <span class="tag"><strong>モード</strong> {mode_primary} / {mode_secondary}</span>
+                  </div>
+                  {comp_html}
+                  {note_html}
+                </div>
+                '''
+            )
+        cards_html = "\n".join(parts)
+
+    # main html
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>本日のスクリム情報</title>
+  <style>
+    :root{{
+      --bg:#0b0c10; --card:#11131a; --card2:#0f1117; --line:#232636;
+      --text:#e9ecff; --muted:#aab0d6; --pill:#171a25;
+    }}
+    *{{box-sizing:border-box}}
+    body{{
+      margin:0;
+      background: radial-gradient(1200px 600px at 15% -10%, rgba(122,162,255,.18), transparent 60%),
+                  radial-gradient(800px 500px at 85% 10%, rgba(255,176,32,.12), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif;
+      padding:18px;
+    }}
+    .wrap{{max-width:980px;margin:0 auto}}
+    .top{{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}}
+    .title{{display:flex;flex-direction:column;gap:6px}}
+    h1{{margin:0;font-size:20px;letter-spacing:.3px;display:flex;align-items:center;gap:10px}}
+    .badge{{font-size:12px;padding:3px 10px;border-radius:999px;background: rgba(122,162,255,.14);border:1px solid rgba(122,162,255,.30);color: var(--text);}}
+    .sub{{color:var(--muted);font-size:12px;line-height:1.4}}
+    .legend{{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;font-size:12px;color:var(--muted)}}
+    .legend span{{background:var(--pill);border:1px solid var(--line);padding:4px 10px;border-radius:999px}}
+
+    .grid{{display:grid;grid-template-columns: 1.2fr .8fr;gap:12px;align-items:start}}
+    .panel{{background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 40%), var(--card);
+      border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow: 0 10px 35px rgba(0,0,0,.35);}}
+    .panelHead{{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;background: rgba(255,255,255,.02);}}
+    .panelHead b{{font-size:13px}}
+    .panelHead .right{{font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}
+    .pill{{background:var(--pill);border:1px solid var(--line);padding:4px 10px;border-radius:999px;color:var(--muted)}}
+
+    .list{{padding:12px;display:flex;flex-direction:column;gap:10px}}
+    .card{{background: var(--card2);border:1px solid var(--line);border-radius:14px;padding:12px}}
+    .row1{{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}}
+    .name{{font-size:14px;font-weight:900;line-height:1.25;display:flex;align-items:center;gap:8px;min-width:0}}
+    .name .truncate{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}}
+    .meta{{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--muted)}}
+    .tag{{border:1px solid var(--line);background: rgba(255,255,255,.02);padding:4px 10px;border-radius:999px}}
+    .tag strong{{color:var(--text)}}
+    .note{{margin-top:10px;font-size:12px;color:var(--muted);line-height:1.45;border-top:1px dashed rgba(170,176,214,.25);padding-top:10px}}
+    .note b{{color:var(--text)}}
+
+    .kpi{{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}}
+    .stat{{background: rgba(255,255,255,.02);border:1px solid var(--line);border-radius:14px;padding:12px}}
+    .stat .label{{font-size:12px;color:var(--muted)}}
+    .stat .value{{font-size:20px;font-weight:900;margin-top:6px}}
+    .stat .hint{{font-size:12px;color:var(--muted);margin-top:4px}}
+
+    .ico{{font-size:16px;line-height:1}}
+    .ico.none{{opacity:.6}}
+
+    @media (max-width: 860px){{ .grid{{grid-template-columns:1fr}} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="title">
+        <h1>本日のスクリム情報 <span class="badge">{_html_esc(date_badge)}</span></h1>
+        <div class="sub">🟠 回転式｜🔵 従来式｜（方式「登録しない」はアイコン無し）</div>
+      </div>
+      <div class="legend">
+        <span>更新: <b>{_html_esc(updated)}</b></span>
+        <span>予定数: <b>{len(events)}</b></span>
+        <span>表示: スクリム名 / モード / 時間 / 試合数 / 備考</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <b>今日の予定</b>
+          <div class="right"><span class="pill">JP</span><span class="pill">Discord用</span></div>
+        </div>
+        <div class="list">
+          {cards_html}
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead"><b>サマリー</b><div class="right"><span class="pill">集計</span></div></div>
+        <div class="kpi">
+          <div class="stat"><div class="label">従来式 🔵</div><div class="value">{kpi_trad}</div><div class="hint">試合数があるタイプ</div></div>
+          <div class="stat"><div class="label">回転式 🟠</div><div class="value">{kpi_rot}</div><div class="hint">回転式 / 形式固定なし</div></div>
+          <div class="stat"><div class="label">登録しない</div><div class="value">{kpi_none}</div><div class="hint">アイコン無しで表示</div></div>
+          <div class="stat"><div class="label">最初の開始</div><div class="value">{_html_esc(kpi_first)}</div><div class="hint">時間未入力は除外</div></div>
+        </div>
+        <div class="list" style="padding-top:0">
+          <div class="card">
+            <div class="row1"><div class="name"><span class="ico">📌</span><span class="truncate">自動生成</span></div></div>
+            <div class="note"><b>DB</b> { _html_esc(SCRIM_CALENDAR_DB_PATH) }</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+async def _try_render_png_from_html_panel(html: str, width: int = 980, height: int = 820) -> Optional[bytes]:
+    try:
+        from playwright.async_api import async_playwright
+    except Exception:
+        return None
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page(viewport={"width": int(width), "height": int(height)})
+            with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
+                f.write(html)
+                html_path = f.name
+            await page.goto("file://" + html_path)
+            try:
+                await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            png = await page.screenshot(type="png")
+            await browser.close()
+        try:
+            os.remove(html_path)
+        except Exception:
+            pass
+        return png
+    except Exception as e:
+        print(f"[WARN] today panel render failed: {e}")
+        return None
+
+
+async def render_today_scrim_panel_png(today_ymd: Optional[str] = None) -> bytes:
+    """今日の予定をDBから集計し、Discord投稿用PNG(bytes)を返す"""
+    if not today_ymd:
+        today_ymd = jst_date_str(utc_now())
+
+    events = _read_today_scrim_events_from_db(today_ymd)
+    html = _build_today_panel_html(today_ymd, events)
+
+    png = await _try_render_png_from_html_panel(html)
+    if not png:
+        raise RuntimeError("panel render failed (playwright not available?)")
+    return png
+
 # =====================
 # Key Image Rendering (Replaced HTML)
 # =====================
@@ -587,6 +935,10 @@ class GuildConfig:
     scrim: Dict[str, Any] = None
     admin_panel_message_id: Optional[int] = None
     admin_panel_channel_id: Optional[int] = None
+
+    # 告知メッセージ（最後に投稿したもの）
+    announce_message_id: Optional[int] = None
+    announce_channel_id: Optional[int] = None
 
     # 告知（参加予定）: { message_id(str): [user_id, ...] }
     participations: Dict[str, List[int]] = None
@@ -736,6 +1088,89 @@ class AnnounceView(discord.ui.View):
 
 
 
+# =====================
+# Traditional Host Controls on Announcement (persistent)
+# =====================
+
+class TradHostRecruitButton(discord.ui.Button):
+    def __init__(self, enabled: bool):
+        style = discord.ButtonStyle.primary if enabled else discord.ButtonStyle.gray
+        super().__init__(
+            label="キーホストします",
+            style=style,
+            custom_id="scrim:trad_host_recruit",
+            disabled=(not enabled),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not interaction.message:
+            await interaction.response.defer()
+            return
+        bot: ScrimBot = interaction.client  # type: ignore
+        cfg = bot.cfg(interaction.guild.id)
+        scrim = cfg.scrim or {}
+
+        if scrim.get("trad_host_user_id"):
+            await interaction.response.send_message("既にキーホストは見つかっています。", ephemeral=True)
+            return
+
+        scrim["trad_host_user_id"] = interaction.user.id
+        scrim["trad_host_selected_at"] = to_iso(utc_now())
+        await bot._save_all()
+
+        members = cfg.participations.get(str(interaction.message.id), []) or []
+        embed = _announce_embed(interaction.guild, scrim, members)
+        await interaction.response.edit_message(embed=embed, view=TraditionalAnnounceView(has_host=True))
+
+
+class TradHostCancelButton(discord.ui.Button):
+    def __init__(self, enabled: bool):
+        style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.gray
+        super().__init__(
+            label="キーホストキャンセル",
+            style=style,
+            custom_id="scrim:trad_host_cancel",
+            disabled=(not enabled),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not interaction.message:
+            await interaction.response.defer()
+            return
+        bot: ScrimBot = interaction.client  # type: ignore
+        cfg = bot.cfg(interaction.guild.id)
+        scrim = cfg.scrim or {}
+
+        host_id = scrim.get("trad_host_user_id")
+        if not host_id:
+            await interaction.response.send_message("現在、キーホストは募集中です。", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(interaction.user.id)
+        can = (interaction.user.id == int(host_id))
+        if member and member.guild_permissions and member.guild_permissions.manage_guild:
+            can = True
+
+        if not can:
+            await interaction.response.send_message("キーホスト本人、または運営のみキャンセルできます。", ephemeral=True)
+            return
+
+        scrim.pop("trad_host_user_id", None)
+        scrim.pop("trad_host_selected_at", None)
+        await bot._save_all()
+
+        members = cfg.participations.get(str(interaction.message.id), []) or []
+        embed = _announce_embed(interaction.guild, scrim, members)
+        await interaction.response.edit_message(embed=embed, view=TraditionalAnnounceView(has_host=False))
+
+
+class TraditionalAnnounceView(discord.ui.View):
+    def __init__(self, has_host: bool = False):
+        super().__init__(timeout=None)
+        self.add_item(TradHostRecruitButton(enabled=(not has_host)))
+        self.add_item(TradHostCancelButton(enabled=has_host))
+
+
 
 # =====================
 # Admin Panel (Scrim Settings Embed + Toggles)
@@ -750,7 +1185,23 @@ def _scrim_cfg(bot: "ScrimBot", guild_id: int) -> Dict[str, Any]:
 
 def _announce_embed(guild: discord.Guild, scrim: Dict[str, Any], members: list[int]) -> discord.Embed:
     org = scrim.get("org") or "未設定"
-    start = scrim.get("start_at_jst") or "未設定"
+
+    start_raw = scrim.get("start_at_jst") or "未設定"
+    start = start_raw
+    try:
+        if start_raw and start_raw != "未設定":
+            # accept "YYYY-MM-DD HH:MM" or "YYYY/MM/DD HH:MM"
+            date_part = start_raw.split(" ")[0].replace("/", "-")
+            time_part = start_raw.split(" ")[1] if " " in start_raw else ""
+            y, mo, d = date_part.split("-")
+            import datetime as _dt
+            wd = ["月", "火", "水", "木", "金", "土", "日"][_dt.date(int(y), int(mo), int(d)).weekday()]
+            if time_part:
+                start = f"{int(y):04d}/{int(mo):02d}/{int(d):02d}({wd}) {time_part} ～"
+            else:
+                start = f"{int(y):04d}/{int(mo):02d}/{int(d):02d}({wd}) ～"
+    except Exception:
+        start = start_raw
 
     team = scrim.get("team_mode")
     game = scrim.get("game_mode")
@@ -758,41 +1209,28 @@ def _announce_embed(guild: discord.Guild, scrim: Dict[str, Any], members: list[i
     game_label = {"tournament": "トーナメントセッティング", "reload": "リロード"}.get(game, "")
     mode = f"{team_label}（{game_label}）" if game_label else team_label
 
-    system = {"rotation": "回転型", "traditional": "従来型"}.get(scrim.get("system"), "未設定")
-
-    lines: List[str] = []
-    for uid in members:
-        m = guild.get_member(uid)
-        if m:
-            lines.append(f"・{m.display_name}")
-    member_text = "
-".join(lines) if lines else "（なし）"
-
-    team_count = len(members)
-
-    notes = (
-        "※チームで1人のみが押してください
-"
-        "※参加するを押したチームには優先してキーを告知します
-"
-        "※参加予定申請のみで実際に参加していない場合、
-"
-        "　累計3回でBANさせていただきます。
-"
-        "※開始30分前に締め切りますが、
-"
-        "　参加するを押していなくても参加は可能です。"
-    )
+    system_key = scrim.get("system")
+    system_label = {"rotation": "回転型", "traditional": "従来型"}.get(system_key, "未設定")
 
     e = discord.Embed(title="⚔本日開催のスクリム", color=discord.Color.orange())
+
     e.add_field(name="開催団体：", value=org, inline=False)
-    e.add_field(name="開始時間：", value=start, inline=False)
-    e.add_field(name="モード：", value=mode, inline=False)
-    e.add_field(name="開催方式：", value=system, inline=False)
-    e.add_field(name="ーーーーーーーーーーーーー", value=f"参加予定チーム数：{team_count}", inline=False)
-    e.add_field(name="参加予定チーム：", value=member_text, inline=False)
-    e.add_field(name="注意事項", value=notes, inline=False)
+    e.add_field(name="開始日時：", value=start, inline=False)
+    e.add_field(name="モード：", value=(scrim.get("mode_text") or mode), inline=False)
+    e.add_field(name="開催方式：", value=system_label, inline=False)
+
+    if system_key == "rotation":
+        e.description = "💡21:00より1試合目の参加枠受付を開始します。"
+        return e
+
+    if system_key == "traditional":
+        hid = scrim.get("trad_host_user_id")
+        host_line = "見つかりました" if hid else "募集中"
+        e.add_field(name="キーホスト：", value=host_line, inline=False)
+
     return e
+
+
 
 
 def _scrim_embed(guild: discord.Guild, scrim: Dict[str, Any]) -> discord.Embed:
@@ -907,22 +1345,30 @@ class ScrimAdminPanelView(discord.ui.View):
         game = s.get("game_mode")
         system = s.get("system")
 
+        cfg = self.bot.cfg(self.guild_id)
+        announce_active = bool(cfg.announce_message_id)
+
         self.add_item(SetStartButton())
-
-        self.add_item(TeamToggleButton("solo", _is_selected("ソロ", team == "solo")))
-        self.add_item(TeamToggleButton("duo", _is_selected("デュオ", team == "duo")))
-        self.add_item(TeamToggleButton("trio", _is_selected("トリオ", team == "trio")))
-        self.add_item(TeamToggleButton("squad", _is_selected("スクワッド", team == "squad")))
-
-        self.add_item(GameToggleButton("tournament", _is_selected("トーナメントセッティング", game == "tournament")))
-        self.add_item(GameToggleButton("reload", _is_selected("リロード", game == "reload")))
 
         self.add_item(SystemToggleButton("rotation", _is_selected("回転式", system == "rotation")))
         self.add_item(SystemToggleButton("traditional", _is_selected("従来式", system == "traditional")))
         self.add_item(SetMatchCountButton(enabled=(system == "traditional")))
 
-        self.add_item(AnnounceButton())
-        self.add_item(ResetScrimButton())
+        self.add_item(TeamToggleButton("solo", _is_selected("ソロ", team == "solo")))
+        self.add_item(TeamToggleButton("duo", _is_selected("デュオ", team == "duo")))
+        self.add_item(TeamToggleButton("trio", _is_selected("トリオ", team == "trio")))
+        self.add_item(TeamToggleButton("squad", _is_selected("スクワッド", team == "squad")))
+        if system == "traditional":
+            self.add_item(SetTraditionalMultiButton())
+        else:
+            self.add_item(discord.ui.Button(label="複数モード", style=discord.ButtonStyle.gray, row=2, disabled=True))
+
+        self.add_item(GameToggleButton("tournament", _is_selected("トーナメントセッティング", game == "tournament")))
+        self.add_item(GameToggleButton("reload", _is_selected("リロード", game == "reload")))
+
+        self.add_item(AnnounceButton(enabled=(not announce_active)))
+        self.add_item(DeleteAnnounceButton(enabled=announce_active))
+        self.add_item(ResetScrimButton(enabled=(not announce_active)))
 
     async def refresh(self, interaction: discord.Interaction, *, use_edit_message: bool = False):
         self.refresh_buttons(initial=False)
@@ -1021,10 +1467,42 @@ class SystemToggleButton(discord.ui.Button):
         await view.bot._save_all()
         await view.refresh(interaction, use_edit_message=True)
 
+
+class SetTraditionalMultiButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="複数モード", style=discord.ButtonStyle.secondary, row=2, custom_id="scrimadmin:tradmulti")
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ScrimAdminPanelView = self.view  # type: ignore
+        if view.scrim().get("system") != "traditional":
+            await interaction.response.defer()
+            return
+
+        class MultiModeModal(discord.ui.Modal, title="複数モード表記"):
+            def __init__(self, parent_view):
+                super().__init__(timeout=None)
+                self.parent_view = parent_view
+                self.value = discord.ui.TextInput(
+                    label="モード表記（例：ソロ 6戦 / デュオ 4戦）",
+                    required=True,
+                    max_length=100,
+                )
+                self.add_item(self.value)
+
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                view = self.parent_view
+                view.scrim()["mode_text"] = str(self.value).strip()
+                await view.bot._save_all()
+                await view.refresh(modal_interaction)
+                await modal_interaction.response.defer()
+
+        await interaction.response.send_modal(MultiModeModal(self.view))
+
+
 class SetMatchCountButton(discord.ui.Button):
     def __init__(self, enabled: bool):
         style = discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.gray
-        super().__init__(label="試合数", style=style, row=1, disabled=(not enabled), custom_id="scrimadmin:matchcount")
+        super().__init__(label="従来式試合数", style=style, row=1, disabled=(not enabled), custom_id="scrimadmin:matchcount")
 
     async def callback(self, interaction: discord.Interaction):
         view: ScrimAdminPanelView = self.view  # type: ignore
@@ -1058,12 +1536,19 @@ class SetMatchCountButton(discord.ui.Button):
         await interaction.response.send_modal(CountModal(self.view))
 
 class AnnounceButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="告知投稿", style=discord.ButtonStyle.primary, row=4, custom_id="scrimadmin:announce")
+    def __init__(self, enabled: bool = True):
+        super().__init__(label="告知投稿", style=discord.ButtonStyle.primary, row=4, custom_id="scrimadmin:announce", disabled=(not enabled))
 
     async def callback(self, interaction: discord.Interaction):
         view: ScrimAdminPanelView = self.view  # type: ignore
         if not interaction.guild:
+            await interaction.response.defer()
+            return
+
+        cfg = view.bot.cfg(interaction.guild.id)
+
+        # 既に告知があるなら何もしない（削除のみ有効）
+        if cfg.announce_message_id:
             await interaction.response.defer()
             return
 
@@ -1073,28 +1558,69 @@ class AnnounceButton(discord.ui.Button):
         if gch:
             ch = gch
 
-        cfg = view.bot.cfg(interaction.guild.id)
         embed = _announce_embed(interaction.guild, cfg.scrim, [])
-
-        msg = await ch.send(embed=embed, view=AnnounceView())
-        cfg.participations[str(msg.id)] = []
+        # 告知のView：回転型は参加/キャンセル、従来式はキーホスト募集/キャンセル
+        system = (cfg.scrim or {}).get("system")
+        if system == "rotation":
+            msg = await ch.send(embed=embed)
+            cfg.participations[str(msg.id)] = []
+        elif system == "traditional":
+            msg = await ch.send(embed=embed, view=TraditionalAnnounceView(has_host=bool((cfg.scrim or {}).get("trad_host_user_id"))))
+            cfg.participations.setdefault(str(msg.id), [])
+        else:
+            msg = await ch.send(embed=embed)
+        cfg.announce_message_id = msg.id
+        cfg.announce_channel_id = msg.channel.id
         await view.bot._save_all()
 
-        # 管理パネル自体の更新だけ（エフェメラル不要）
-        await interaction.response.defer()
+        # 管理パネル更新：告知投稿/リセット無効、削除のみ有効
+        await view.refresh(interaction, use_edit_message=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
+
+class DeleteAnnounceButton(discord.ui.Button):
+    def __init__(self, enabled: bool = True):
+        super().__init__(label="削除", style=discord.ButtonStyle.secondary, row=4, custom_id="scrimadmin:delete", disabled=(not enabled))
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ScrimAdminPanelView = self.view  # type: ignore
+        if not interaction.guild:
+            await interaction.response.defer()
+            return
+
+        cfg = view.bot.cfg(interaction.guild.id)
+
+        if cfg.announce_message_id and cfg.announce_channel_id:
+            ch = interaction.guild.get_channel(cfg.announce_channel_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(cfg.announce_message_id)
+                    await msg.delete()
+                except Exception:
+                    pass
+
+        cfg.announce_message_id = None
+        cfg.announce_channel_id = None
+        await view.bot._save_all()
+
+        # 管理パネル更新：告知投稿/リセットを有効化
+        await view.refresh(interaction, use_edit_message=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
 
 class ResetScrimButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="リセット", style=discord.ButtonStyle.danger, row=4, custom_id="scrimadmin:reset")
+    def __init__(self, enabled: bool = True):
+        super().__init__(label="リセット", style=discord.ButtonStyle.danger, row=4, custom_id="scrimadmin:reset", disabled=(not enabled))
 
     async def callback(self, interaction: discord.Interaction):
         view: ScrimAdminPanelView = self.view  # type: ignore
         view.bot.cfg(view.guild_id).scrim = {}
         await view.bot._save_all()
         await view.refresh(interaction)
-        await interaction.response.defer()
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
 # =====================
 # Bot
@@ -1113,6 +1639,7 @@ class ScrimBot(commands.Bot):
         self.guild_states: Dict[int, GuildState] = {}
         self._lock = asyncio.Lock()
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._today_panel_last_post: Dict[int, str] = {}
         self._load_all()
 
     # ---------- persistence ----------
@@ -1128,6 +1655,8 @@ class ScrimBot(commands.Bot):
                 scrim=v.get("scrim") or {},
                 admin_panel_message_id=v.get("admin_panel_message_id"),
                 admin_panel_channel_id=v.get("admin_panel_channel_id"),
+                announce_message_id=v.get("announce_message_id"),
+                announce_channel_id=v.get("announce_channel_id"),
                 participations=v.get("participations") or {},
             )
 
@@ -1184,6 +1713,10 @@ class ScrimBot(commands.Bot):
         self.add_view(WaitlistCompleteView(self))
         self.add_view(KeyViewPanelView(self))
         self.add_view(AnnounceView())
+        self.add_view(TraditionalAnnounceView())
+
+        # generated key images cache
+        os.makedirs(GENERATED_KEYS_DIR, exist_ok=True)
         self._register_commands()
         # 管理パネル（再起動後もボタンが死なないように persistent view を登録）
         try:
@@ -1234,6 +1767,7 @@ class ScrimBot(commands.Bot):
             try:
                 await self._daily_reset_if_due()
                 await self._apply_due_thread_deletes()
+                await self._auto_post_today_panel_if_due()
             except Exception as e:
                 print(f"[SCHED] {e}")
             await asyncio.sleep(15)
@@ -1271,6 +1805,40 @@ class ScrimBot(commands.Bot):
             m.host_message_id = None
             m.thread_delete_at = None
             await self._save_all()
+
+    async def _auto_post_today_panel_if_due(self):
+        if not AUTOPOST_TODAY_PANEL:
+            return
+
+        now = utc_now()
+        now_jst = to_jst(now)
+        if (now_jst.hour, now_jst.minute) != (AUTOPOST_HOUR_JST, AUTOPOST_MINUTE_JST):
+            return
+
+        today = jst_date_str(now)
+
+        for guild in list(self.guilds):
+            if self._today_panel_last_post.get(guild.id) == today:
+                continue
+
+            gch = await self.get_global_channel(guild)
+            if not gch:
+                continue
+
+            try:
+                png = await render_today_scrim_panel_png(today)
+            except Exception as e:
+                print(f"[AUTOPOST] render failed ({guild.id}): {e}")
+                continue
+
+            try:
+                file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
+                await gch.send(content="📅【本日のスクリム情報】（自動投稿）", file=file)
+                self._today_panel_last_post[guild.id] = today
+            except Exception as e:
+                print(f"[AUTOPOST] send failed ({guild.id}): {e}")
+                continue
+
 
     # ---------- full reset ----------
     async def _full_reset_guild(self, guild: discord.Guild):
@@ -1390,248 +1958,85 @@ class ScrimBot(commands.Bot):
                 pass
 
 
-    # =====================
-    # Posting
-    # =====================
-
-    async def _post_host_recruit_panel(self, guild: discord.Guild, channel: discord.TextChannel):
-        m = self.active_match(guild.id)
-        if not m:
-            return
-        if m.host_recruit_message_id:
+        # =====================
+        # Posting: Today Scrim Panel (command)
+        # =====================
+        @self.tree.command(name="scrim_today", description="本日のスクリム情報を画像で投稿")
+        async def scrim_today(interaction: discord.Interaction):
+            # 先に応答してタイムアウト回避
             try:
-                old = await channel.fetch_message(m.host_recruit_message_id)
-                await old.edit(view=None)
+                if not interaction.response.is_done():
+                    await interaction.response.defer(thinking=False)
             except Exception:
                 pass
-        msg = await channel.send(content=f"{m.match_no}試合目のキーホストを募集します", view=HostRecruitView(self))
-        m.host_recruit_message_id = msg.id
-        await self._save_all()
 
-    async def _post_key_view_panel(self, guild: discord.Guild, channel: discord.TextChannel):
-        m = self.active_match(guild.id)
-        if not m:
-            return
-        if m.key_view_message_id:
             try:
-                old = await channel.fetch_message(m.key_view_message_id)
-                await old.edit(view=None)
-            except Exception:
-                pass
-        msg = await channel.send(
-            content=f"{m.match_no}試合目のキーをご確認ください\n※閲覧数上限で次のマッチの準備になります",
-            view=KeyViewPanelView(self),
-        )
-        m.key_view_message_id = msg.id
-        await self._save_all()
-
-    # =====================
-    # Handlers
-    # =====================
-
-    async def handle_host_recruit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await _ephemeral_reply(interaction, "サーバー内で実行してください。")
-            return
-
-        await _safe_defer(interaction, ephemeral=True)
-
-        gch = await self.get_global_channel(interaction.guild)
-        m = self.active_match(interaction.guild.id)
-        if not gch or not m:
-            await _ephemeral_reply(interaction, "未準備。/scrim_prepare から開始してください。")
-            return
-        if m.host_selected_at:
-            await _ephemeral_reply(interaction, "既に確定しています。")
-            return
-
-        m.host_selected_at = to_iso(utc_now())
-        m.host_user_id = interaction.user.id
-        planned_dt = utc_now() + datetime.timedelta(minutes=3)
-        m.planned_time_utc = to_iso(planned_dt)
-        m.custom_key = generate_custom_key()
-        await self._save_all()
-
-        # disable recruit panel
-        try:
-            if interaction.message:
-                await interaction.message.edit(view=None)
-        except Exception:
-            pass
-
-        # create host thread
-        thread = await gch.create_thread(
-            name=f"{m.match_no}試合目-キーホスト",
-            type=discord.ChannelType.private_thread,
-            invitable=True,
-            reason="Scrim: keyhost thread",
-        )
-        try:
-            await thread.add_user(interaction.user)
-        except Exception:
-            pass
-
-        m.host_thread_id = thread.id
-        self.gs(interaction.guild.id).created_thread_ids.append(thread.id)
-        await self._save_all()
-
-        planned_hhmm = fmt_hhmm_jst(from_iso(m.planned_time_utc) or planned_dt)
-
-        embed = discord.Embed(description=m.custom_key)
-
-        # まずは必ず本文＋ボタンを出す（画像生成が遅い/失敗しても止めない）
-        try:
-            msg = await thread.send(
-                content=f"{interaction.user.mention}\nキーを確認し、待機列を作ってください。\n\n🔒カスタムキー＜コピペ用＞",
-                embed=embed,
-                view=WaitlistCompleteView(self),
-            )
-            m.host_message_id = msg.id
-            await self._save_all()
-        except Exception as e:
-            print(f"[ERR] host thread initial send failed: {e}")
-            await _ephemeral_reply(interaction, f"スレッドに送信できません: {e}")
-            return
-
-        # 画像は後追いで生成して送る（失敗しても無視して継続）
-        if self.cfg(interaction.guild.id).image_enabled:
-            try:
-                png = await img_host_planned(m.match_no, m.custom_key, planned_hhmm)
-                if png:
-                    await thread.send(files=[discord.File(fp=io.BytesIO(png), filename="host.png")])
+                png = await render_today_scrim_panel_png()
             except Exception as e:
-                print(f"[WARN] host image render/send failed: {e}")
+                msg = f"本日のスクリム情報の生成に失敗しました: {e}"
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg, ephemeral=True)
+                    else:
+                        await interaction.response.send_message(msg, ephemeral=True)
+                except Exception:
+                    pass
+                return
 
-        await _ephemeral_reply(interaction, "キーホストを確定しました。")
-
-    async def handle_waitlist_complete(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await _ephemeral_reply(interaction, "サーバー内で実行してください。")
-            return
-
-        await _safe_defer(interaction, ephemeral=True)
-
-        m = self.active_match(interaction.guild.id)
-        if not m or not m.host_thread_id:
-            await _ephemeral_reply(interaction, "対象スレッドが見つかりません。")
-            return
-        if not interaction.channel or interaction.channel.id != m.host_thread_id:
-            await _ephemeral_reply(interaction, "このボタンはキーホスト用スレッド内で押してください。")
-            return
-        if m.confirmed:
-            await _ephemeral_reply(interaction, "既に確定済みです。")
-            return
-
-        confirmed_at = utc_now()
-        confirmed_time = confirmed_at + datetime.timedelta(minutes=2)
-
-        planned_dt = from_iso(m.planned_time_utc) or (confirmed_at + datetime.timedelta(minutes=3))
-        if planned_dt > confirmed_time:
-            planned_dt = confirmed_time
-            m.planned_time_utc = to_iso(planned_dt)
-
-        m.confirmed = True
-        m.confirmed_at = to_iso(confirmed_at)
-        m.confirmed_time_utc = to_iso(confirmed_time)
-        m.thread_delete_at = to_iso(confirmed_time + datetime.timedelta(minutes=2))
-        await self._save_all()
-
-        confirmed_hhmm = fmt_hhmm_jst(confirmed_time)
-
-        # disable pressed button
-        try:
-            if interaction.message:
-                await interaction.message.edit(view=None)
-        except Exception:
-            pass
-
-        # post confirmed card
-        if self.cfg(interaction.guild.id).image_enabled:
-            png = await img_host_confirmed(m.match_no, m.custom_key or "", confirmed_hhmm)
-            if png:
-                await interaction.channel.send(files=[discord.File(fp=io.BytesIO(png), filename="confirmed.png")])
-            else:
-                await interaction.channel.send(
-                    "ーーーーーーーーーーーー\n"
-                    f"📢開始時間は【{confirmed_hhmm}】で確定しました\n"
-                    "時間になりましたらマッチ開始してください\n"
-                    "ーーーーーーーーーーーー"
-                )
-        else:
-            await interaction.channel.send(
-                "ーーーーーーーーーーーー\n"
-                f"📢開始時間は【{confirmed_hhmm}】で確定しました\n"
-                "時間になりましたらマッチ開始してください\n"
-                "ーーーーーーーーーーーー"
-            )
-
-        # post key view panel
-        gch = await self.get_global_channel(interaction.guild)
-        if gch:
-            await self._post_key_view_panel(interaction.guild, gch)
-
-        await _ephemeral_reply(interaction, "キー閲覧を開始しました。")
-
-    async def handle_key_view(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await _ephemeral_reply(interaction, "サーバー内で実行してください。")
-            return
-
-        await _safe_defer(interaction, ephemeral=True)
-
-        m = self.active_match(interaction.guild.id)
-        if not m or not interaction.message or interaction.message.id != m.key_view_message_id:
-            await _ephemeral_reply(interaction, "無効。最新のパネルから操作してください。")
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not member.voice or not member.voice.channel:
-            await _ephemeral_reply(interaction, "VCに接続してから押してください。")
-            return
-
-        # "原則1度押し" -> count once per user but allow retry to show key
-        if interaction.user.id not in set(m.pressed_user_ids):
-            m.pressed_user_ids.append(interaction.user.id)
-
-        vc_id = member.voice.channel.id
-        counted: Set[int] = set(m.counted_vc_ids)
-        before = len(counted)
-        counted.add(vc_id)
-        after = len(counted)
-        if after != before:
-            m.counted_vc_ids = list(counted)
-            await self._save_all()
-
-        # send ephemeral key
-        files = []
-        if self.cfg(interaction.guild.id).image_enabled:
-            png = await img_key_ephemeral(m.match_no, m.custom_key or "")
-            if png:
-                files.append(discord.File(fp=io.BytesIO(png), filename="key.png"))
-
-        embed = discord.Embed(description=m.custom_key)
-        if files:
-            await interaction.followup.send(content="🔒カスタムキー＜コピペ用＞", embed=embed, files=files, ephemeral=True)
-        else:
-            await interaction.followup.send(content="🔒カスタムキー＜コピペ用＞", embed=embed, ephemeral=True)
-
-        # cap check (by vc id)
-        if len(counted) >= self.viewer_limit(m.size_mode):
-            # disable panel
+            file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
             try:
-                if interaction.message:
-                    await interaction.message.edit(view=None)
+                if interaction.response.is_done():
+                    await interaction.followup.send(content="📅【本日のスクリム情報】", file=file)
+                else:
+                    await interaction.response.send_message(content="📅【本日のスクリム情報】", file=file)
+            except Exception:
+                if interaction.channel:
+                    await interaction.channel.send(content="📅【本日のスクリム情報】", file=file)
+
+
+        @self.tree.command(name="scrim_today_preview", description="本日のスクリム情報（プレビュー）を画像で表示")
+        async def scrim_today_preview(interaction: discord.Interaction):
+            # 管理者（サーバー管理）だけ実行可
+            try:
+                if interaction.guild and (not interaction.user.guild_permissions.manage_guild):
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("権限がありません（サーバー管理権限が必要です）。", ephemeral=True)
+                    else:
+                        await interaction.followup.send("権限がありません（サーバー管理権限が必要です）。", ephemeral=True)
+                    return
             except Exception:
                 pass
 
-            # next match
-            next_match = MatchState(match_no=m.match_no + 1, size_mode=m.size_mode, match_type=m.match_type)
-            self.gs(interaction.guild.id).active_match = next_match
-            await self._save_all()
+            # 先に応答してタイムアウト回避（ephemeral）
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True, thinking=False)
+            except Exception:
+                pass
 
-            gch = await self.get_global_channel(interaction.guild)
-            if gch:
-                await self._post_host_recruit_panel(interaction.guild, gch)
+            try:
+                png = await render_today_scrim_panel_png()
+            except Exception as e:
+                msg = f"本日のスクリム情報（プレビュー）の生成に失敗しました: {e}"
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg, ephemeral=True)
+                    else:
+                        await interaction.response.send_message(msg, ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            file = discord.File(fp=io.BytesIO(png), filename="today_scrim_preview.png")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(content="🧪【本日のスクリム情報｜プレビュー】", file=file, ephemeral=True)
+                else:
+                    await interaction.response.send_message(content="🧪【本日のスクリム情報｜プレビュー】", file=file, ephemeral=True)
+            except Exception:
+                # 最終フォールバック（チャンネルに投げない：プレビューのため）
+                pass
+
 
 
 def main():
