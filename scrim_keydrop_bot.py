@@ -384,12 +384,13 @@ async def _try_render_png_from_html_key(html: str) -> Optional[bytes]:
 # =====================
 
 def _scrim_panel_icon(style: str) -> str:
-    if style == "従来式":
-        return "🔵"
-    if style == "回転式":
+    s = (style or "").strip()
+    if s == "回転式":
         return "🟠"
+    if s == "従来式":
+        return "🔵"
+    # 登録しない / 未設定 / その他
     return ""
-
 
 def _html_esc(s: Any) -> str:
     s = "" if s is None else str(s)
@@ -448,6 +449,50 @@ def _read_today_scrim_events_from_db(today_ymd: str) -> List[Dict[str, Any]]:
     return out
 
 
+
+def _ensure_scrim_channel_map_table(db_path: str) -> None:
+    # scrim名(=events.title) -> channel_id (複数可)
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS scrim_channel_map ("
+            " guild_id INTEGER NOT NULL,"
+            " scrim_name TEXT NOT NULL,"
+            " channel_id INTEGER NOT NULL,"
+            " PRIMARY KEY (guild_id, scrim_name, channel_id)"
+            ")"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _lookup_scrim_channels_from_db(guild_id: int, scrim_name: str) -> List[int]:
+    db_path = SCRIM_CALENDAR_DB_PATH
+    if not os.path.exists(db_path):
+        return []
+    try:
+        _ensure_scrim_channel_map_table(db_path)
+    except Exception:
+        return []
+    con = sqlite3.connect(db_path)
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT channel_id FROM scrim_channel_map WHERE guild_id = ? AND scrim_name = ? ORDER BY channel_id",
+            (int(guild_id), str(scrim_name)),
+        ).fetchall()
+        out: List[int] = []
+        for r in rows:
+            try:
+                out.append(int(r["channel_id"]))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+    finally:
+        con.close()
 def _build_today_panel_html(
     today_ymd: str,
     events: List[Dict[str, Any]],
@@ -471,7 +516,7 @@ def _build_today_panel_html(
         parts: List[str] = []
         for e in events:
             icon = _scrim_panel_icon(e.get("style", ""))
-            icon_html = f'<span class="ico">{_html_esc(icon)}</span>' if icon else '<span class="ico none">⚪</span>'
+            icon_html = f'<span class="ico">{_html_esc(icon)}</span>' if icon else ''
 
             title = _html_esc(e.get("title", ""))
             style = _html_esc(e.get("style", "")) or "登録しない"
@@ -1113,6 +1158,36 @@ class KeyViewPanelView(discord.ui.View):
 
 
 # =====================
+# Today Panel Buttons (per-scrim channels)
+# =====================
+
+class TodayTraditionalChannelView(discord.ui.View):
+    def __init__(self, scrim_name: str):
+        super().__init__(timeout=None)
+        self.scrim_name = scrim_name
+
+    @discord.ui.button(label="キーホスト募集", style=discord.ButtonStyle.primary, custom_id="scrim:today_trad_host_recruit")
+    async def recruit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"このスクリム（{self.scrim_name}）のキーホスト募集は、運営コマンドで開始してください。",
+            ephemeral=True,
+        )
+
+
+class TodayRotationChannelView(discord.ui.View):
+    def __init__(self, scrim_name: str):
+        super().__init__(timeout=None)
+        self.scrim_name = scrim_name
+
+    @discord.ui.button(label="1試合目の枠予約", style=discord.ButtonStyle.primary, custom_id="scrim:today_rotation_match1_reserve")
+    async def reserve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"このスクリム（{self.scrim_name}）の1試合目枠予約は、運営コマンドで開始してください。",
+            ephemeral=True,
+        )
+
+
+# =====================
 # Announcement Participation View (persistent)
 # =====================
 
@@ -1707,6 +1782,11 @@ class ResetScrimButton(discord.ui.Button):
 # =====================
 
 class ScrimBot(commands.Bot):
+    async def on_interaction(self, interaction: discord.Interaction):
+        # 既定の挙動は discord.py 側で処理されるため、ここでレスポンス削除などは行わない
+        # （delete_original_response をここで行うと、コマンド結果がチャンネルに出ない等の不具合になる）
+        return
+
     def __init__(self):
         intents = discord.Intents.none()
         intents.guilds = True
@@ -1887,43 +1967,81 @@ class ScrimBot(commands.Bot):
             m.host_message_id = None
             m.thread_delete_at = None
             await self._save_all()
+    async def _auto_post_today_panel_if_due(self):
+        if not AUTOPOST_TODAY_PANEL:
+            return
 
-async def _auto_post_today_panel_if_due(self):
-    if not AUTOPOST_TODAY_PANEL:
-        return
+        now = utc_now()
+        now_jst = to_jst(now)
+        if (now_jst.hour, now_jst.minute) != (AUTOPOST_HOUR_JST, AUTOPOST_MINUTE_JST):
+            return
 
-    now = utc_now()
-    now_jst = to_jst(now)
-    if (now_jst.hour, now_jst.minute) != (AUTOPOST_HOUR_JST, AUTOPOST_MINUTE_JST):
-        return
+        today = jst_date_str(now)
 
-    today = jst_date_str(now)
+        for guild in list(self.guilds):
+            if self._today_panel_last_post.get(guild.id) == today:
+                continue
 
-    for guild in list(self.guilds):
-        if self._today_panel_last_post.get(guild.id) == today:
-            continue
+            gch = await self.get_global_channel(guild)
+            if not gch:
+                continue
 
-        gch = await self.get_global_channel(guild)
-        if not gch:
-            continue
+            try:
+                events = _read_today_scrim_events_from_db(today)
+            except Exception as e:
+                print(f"[AUTOPOST] read events failed ({guild.id}): {e}")
+                continue
 
-        try:
-            pages = await render_today_scrim_panel_png_pages(today)
-        except Exception as e:
-            print(f"[AUTOPOST] render failed ({guild.id}): {e}")
-            continue
+            try:
+                # ① 全体用チャンネル：全件まとめて1枚（サマリーなし）
+                html_all = _build_today_panel_html(today, events, page_no=1, page_total=1)
+                png_all = await _try_render_png_from_html_panel(html_all)
+                if not png_all:
+                    raise RuntimeError("panel render failed")
+                file_all = discord.File(fp=io.BytesIO(png_all), filename="today_scrim_all.png")
+                await gch.send(file=file_all)
 
-        try:
-            # 画像のみ投稿（余計なテキストやページ番号は一切送らない）
-            for i, png in enumerate(pages, start=1):
-                file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_{i:02d}.png")
-                await gch.send(file=file)
-            self._today_panel_last_post[guild.id] = today
-        except Exception as e:
-            print(f"[AUTOPOST] send failed ({guild.id}): {e}")
-            continue
+                # ② 団体別チャンネル：個別（1件=1枚）を送信
+                for e in events:
+                    scrim_name = str(e.get("title") or "").strip()
+                    if not scrim_name:
+                        continue
 
-    # ---------- full reset ----------
+                    channel_ids = _lookup_scrim_channels_from_db(guild.id, scrim_name)
+                    if not channel_ids:
+                        continue
+
+                    html_one = _build_today_panel_html(today, [e], page_no=1, page_total=1)
+                    png_one = await _try_render_png_from_html_panel(html_one)
+                    if not png_one:
+                        continue
+
+                    style = str(e.get("style") or "").strip()
+                    view = None
+                    if style == "従来式":
+                        view = TodayTraditionalChannelView(scrim_name)
+                    elif style == "回転式":
+                        view = TodayRotationChannelView(scrim_name)
+
+                    for cid in channel_ids:
+                        ch = guild.get_channel(int(cid)) or self.get_channel(int(cid))
+                        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                            continue
+                        file_one = discord.File(fp=io.BytesIO(png_one), filename="today_scrim.png")
+                        try:
+                            await ch.send(file=file_one, view=view)  # type: ignore
+                        except Exception:
+                            try:
+                                await ch.send(file=file_one)  # type: ignore
+                            except Exception:
+                                pass
+
+                self._today_panel_last_post[guild.id] = today
+
+            except Exception as e:
+                print(f"[AUTOPOST] post failed ({guild.id}): {e}")
+                continue
+
     async def _full_reset_guild(self, guild: discord.Guild):
         gs = self.gs(guild.id)
         cfg = self.cfg(guild.id)
@@ -1964,6 +2082,203 @@ async def _auto_post_today_panel_if_due(self):
             self.cfg(interaction.guild.id).global_channel_id = channel.id
             await self._save_all()
             await interaction.response.defer()
+
+
+        @self.tree.command(name="scrim_channel_add", description="団体別チャンネルを登録（スクリム名→チャンネル）")
+        async def scrim_channel_add(interaction: discord.Interaction, scrim_name: str, channel: discord.TextChannel):
+            if not interaction.guild:
+                await interaction.response.defer()
+                return
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and perms.manage_guild):
+                await interaction.response.send_message("権限がありません。", ephemeral=True)
+                return
+
+            name = (scrim_name or "").strip()
+            if not name:
+                await interaction.response.send_message("scrim_name が空です。", ephemeral=True)
+                return
+
+            db_path = SCRIM_CALENDAR_DB_PATH
+            try:
+                _ensure_scrim_channel_map_table(db_path)
+                con = sqlite3.connect(db_path)
+                try:
+                    con.execute(
+                        "INSERT OR IGNORE INTO scrim_channel_map (guild_id, scrim_name, channel_id) VALUES (?,?,?)",
+                        (int(interaction.guild.id), name, int(channel.id)),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+            except Exception as e:
+                await interaction.response.send_message(f"登録に失敗しました: {e}", ephemeral=True)
+                return
+
+            await interaction.response.send_message(f"登録しました: **{name}** → {channel.mention}", ephemeral=True)
+
+        @self.tree.command(name="scrim_channel_remove", description="団体別チャンネルを削除（スクリム名→チャンネル）")
+        async def scrim_channel_remove(interaction: discord.Interaction, scrim_name: str, channel: discord.TextChannel):
+            if not interaction.guild:
+                await interaction.response.defer()
+                return
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and perms.manage_guild):
+                await interaction.response.send_message("権限がありません。", ephemeral=True)
+                return
+
+            name = (scrim_name or "").strip()
+            if not name:
+                await interaction.response.send_message("scrim_name が空です。", ephemeral=True)
+                return
+
+            db_path = SCRIM_CALENDAR_DB_PATH
+            try:
+                _ensure_scrim_channel_map_table(db_path)
+                con = sqlite3.connect(db_path)
+                try:
+                    cur = con.execute(
+                        "DELETE FROM scrim_channel_map WHERE guild_id = ? AND scrim_name = ? AND channel_id = ?",
+                        (int(interaction.guild.id), name, int(channel.id)),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+            except Exception as e:
+                await interaction.response.send_message(f"削除に失敗しました: {e}", ephemeral=True)
+                return
+
+            if cur.rowcount == 0:
+                await interaction.response.send_message("該当する登録が見つかりませんでした。", ephemeral=True)
+                return
+
+            await interaction.response.send_message(f"削除しました: **{name}** → {channel.mention}", ephemeral=True)
+
+        @self.tree.command(name="scrim_channel_list", description="団体別チャンネル登録一覧を表示")
+        async def scrim_channel_list(interaction: discord.Interaction, scrim_name: str = ""):
+            if not interaction.guild:
+                await interaction.response.defer()
+                return
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and perms.manage_guild):
+                await interaction.response.send_message("権限がありません。", ephemeral=True)
+                return
+
+            name = (scrim_name or "").strip()
+            db_path = SCRIM_CALENDAR_DB_PATH
+            try:
+                _ensure_scrim_channel_map_table(db_path)
+                con = sqlite3.connect(db_path)
+                try:
+                    con.row_factory = sqlite3.Row
+                    if name:
+                        rows = con.execute(
+                            "SELECT scrim_name, channel_id FROM scrim_channel_map WHERE guild_id = ? AND scrim_name = ? ORDER BY scrim_name, channel_id",
+                            (int(interaction.guild.id), name),
+                        ).fetchall()
+                    else:
+                        rows = con.execute(
+                            "SELECT scrim_name, channel_id FROM scrim_channel_map WHERE guild_id = ? ORDER BY scrim_name, channel_id",
+                            (int(interaction.guild.id),),
+                        ).fetchall()
+                finally:
+                    con.close()
+            except Exception as e:
+                await interaction.response.send_message(f"取得に失敗しました: {e}", ephemeral=True)
+                return
+
+            if not rows:
+                await interaction.response.send_message("登録はありません。", ephemeral=True)
+                return
+
+            # 表示（最大2000文字に収める）
+            lines = []
+            for r in rows:
+                sn = str(r["scrim_name"])
+                cid = int(r["channel_id"])
+                lines.append(f"- **{sn}** → <#{cid}>")
+            msg = "\n".join(lines)
+            if len(msg) > 1900:
+                msg = msg[:1900] + "\n...(省略)"
+            await interaction.response.send_message(msg, ephemeral=True)
+
+        @self.tree.command(name="scrim_today", description="本日の自動投稿を手動で実行（全体1枚＋団体別個別）")
+        async def scrim_today(interaction: discord.Interaction):
+            if not interaction.guild:
+                await interaction.response.defer()
+                return
+            # 管理者（サーバー管理）権限のみ
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and perms.manage_guild):
+                await interaction.response.send_message("権限がありません。", ephemeral=True)
+                return
+
+            await interaction.response.defer(thinking=True, ephemeral=True)
+
+            guild = interaction.guild
+            gch = await self.get_global_channel(guild)
+            if not gch:
+                await interaction.followup.send("全体チャンネルが未設定です。/scrim_set_channel で設定してください。", ephemeral=True)
+                return
+
+            now = utc_now()
+            today = jst_date_str(now)
+
+            try:
+                events = _read_today_scrim_events_from_db(today)
+            except Exception as e:
+                await interaction.followup.send(f"DB読込に失敗しました: {e}", ephemeral=True)
+                return
+
+            try:
+                # ① 全体用チャンネル：全件まとめて1枚（サマリーなし）
+                html_all = _build_today_panel_html(today, events, page_no=1, page_total=1)
+                png_all = await _try_render_png_from_html_panel(html_all)
+                if not png_all:
+                    raise RuntimeError("panel render failed")
+                file_all = discord.File(fp=io.BytesIO(png_all), filename="today_scrim_all.png")
+                await gch.send(file=file_all)
+
+                # ② 団体別チャンネル：個別（1件=1枚）を送信（未登録はスキップ）
+                for e in events:
+                    scrim_name = str(e.get("title") or "").strip()
+                    if not scrim_name:
+                        continue
+
+                    channel_ids = _lookup_scrim_channels_from_db(guild.id, scrim_name)
+                    if not channel_ids:
+                        continue  # スキップ
+
+                    html_one = _build_today_panel_html(today, [e], page_no=1, page_total=1)
+                    png_one = await _try_render_png_from_html_panel(html_one)
+                    if not png_one:
+                        continue
+
+                    view = None
+                    _style = str(e.get("style") or "").strip()
+                    if _style == "従来式":
+                        view = TodayTraditionalChannelView(scrim_name)
+                    elif _style == "回転式":
+                        view = TodayRotationChannelView(scrim_name)
+
+                    for cid in channel_ids:
+                        ch = guild.get_channel(int(cid)) or self.get_channel(int(cid))
+                        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                            continue
+                        file_one = discord.File(fp=io.BytesIO(png_one), filename="today_scrim.png")
+                        try:
+                            await ch.send(file=file_one, view=view)  # type: ignore
+                        except Exception:
+                            try:
+                                await ch.send(file=file_one)  # type: ignore
+                            except Exception:
+                                pass
+
+            except Exception as e:
+                await interaction.followup.send(f"投稿に失敗しました: {e}", ephemeral=True)
+                return
+
+            await interaction.followup.send("手動投稿しました。", ephemeral=True)
 
         @self.tree.command(name="scrim_prepare", description="準備確定→1試合目募集")
         @app_commands.choices(size_mode=SIZE_CHOICES, match_type=TYPE_CHOICES)
@@ -2046,46 +2361,55 @@ async def _auto_post_today_panel_if_due(self):
         # =====================
         # (removed legacy tree.command scrim_today: use app_commands Cog version)
 
-@self.tree.command(name="scrim_today_preview", description="本日のスクリム情報（プレビュー）を画像のみで投稿")
-async def scrim_today_preview(interaction: discord.Interaction):
-    # コマンド実行ログ（「○○さんがコマンドを使用しました」）を出さないため、
-    # 最初の応答はephemeralで握り、実際の投稿はチャンネルへ直接送信する。
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
 
-    try:
-        pages = await render_today_scrim_panel_png_pages()
-    except Exception as e:
-        msg = f"プレビュー生成に失敗しました: {e}\nDB: {SCRIM_CALENDAR_DB_PATH}"
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
-        return
+        @self.tree.command(name="scrim_today_preview", description="本日のスクリム情報（プレビュー）を画像で投稿")
+        async def scrim_today_preview(interaction: discord.Interaction):
+            # 先に応答してタイムアウト回避（エフェメラルは使わない）
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True, thinking=True)
+            except Exception:
+                pass
 
-    # 画像のみ投稿（テキストは一切付けない）
-    try:
-        for i, png in enumerate(pages, start=1):
-            file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
-            await interaction.channel.send(file=file)  # type: ignore
-    except Exception:
-        # 失敗しても極力投稿
-        if interaction.channel:
-            for i, png in enumerate(pages, start=1):
-                file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
-                await interaction.channel.send(file=file)  # type: ignore
+            try:
+                pages = await render_today_scrim_panel_png_pages()
+            except Exception as e:
+                msg = f"プレビュー生成に失敗しました: {e}\nDB: {SCRIM_CALENDAR_DB_PATH}"
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg)
+                    else:
+                        await interaction.response.send_message(msg)
+                except Exception:
+                    pass
+                return
 
-    # エフェメラル応答を掃除（あれば）
-    try:
-        await interaction.delete_original_response()
-    except Exception:
-        pass
+            try:
+                # コマンド実行ログ（「○○さんがコマンドを使用しました」）を出さないため、
+                # 最初の応答はephemeralで握り、実際の投稿はチャンネルへ直接送信する。
+                total = len(pages)
+                for i, png in enumerate(pages, start=1):
+                    suffix = f"（{i}/{total}）" if total > 1 else ""
+                    file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
+                    content = f"{suffix}"
+                    if interaction.channel:
+                        await interaction.channel.send(file=file)  # type: ignore
+                # ephemereal応答は残さない
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
+            except Exception:
+                if interaction.channel:
+                    total = len(pages)
+                    for i, png in enumerate(pages, start=1):
+                        suffix = f"（{i}/{total}）" if total > 1 else ""
+                        file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
+                        await interaction.channel.send(file=file)  # type: ignore
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
 
 
     # =====================
@@ -2107,41 +2431,3 @@ if __name__ == "__main__":
 
 
 
-# =====================
-# Scrim Today Test Cog
-# =====================
-class ScrimTodayCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(
-        name="scrim_today",
-        description="本日のスクリム情報を画像で投稿（テスト用）"
-    )
-    async def scrim_today(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
-
-        try:
-            pages = await render_today_scrim_panel_png_pages()
-        except Exception as e:
-            await interaction.followup.send(f"生成失敗: {e}", ephemeral=True)
-            return
-
-        for png, style in pages:
-            file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
-            view = None
-            if style == "従来式":
-                view = TodayTraditionalButtons(self.bot)
-            elif style == "回転式":
-                view = TodayRotationButtons(self.bot)
-
-            await interaction.channel.send(file=file, view=view)
-
-        try:
-            await interaction.delete_original_response()
-        except Exception:
-            pass
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(ScrimTodayCog(bot))
