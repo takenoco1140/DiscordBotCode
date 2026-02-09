@@ -27,6 +27,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Set, List
 
 import discord
+from collections import defaultdict
 from discord import app_commands
 from discord.ext import commands
 
@@ -46,6 +47,11 @@ RESET_MINUTE_JST = 0
 AUTOPOST_TODAY_PANEL = os.environ.get("SCRIM_TODAY_AUTOPOST", "1") != "0"
 AUTOPOST_HOUR_JST = int(os.environ.get("SCRIM_TODAY_POST_HOUR_JST", "17"))
 AUTOPOST_MINUTE_JST = int(os.environ.get("SCRIM_TODAY_POST_MINUTE_JST", "0"))
+
+# 今日パネルを「何件ごとに分割するか」(例: 1なら 1件=1枚)
+TODAY_PANEL_MAX_EVENTS_PER_PAGE = int(os.environ.get("SCRIM_TODAY_MAX_EVENTS_PER_PANEL", "1"))
+if TODAY_PANEL_MAX_EVENTS_PER_PAGE <= 0:
+    TODAY_PANEL_MAX_EVENTS_PER_PAGE = 1
 
 
 TEAM_LIMITS: Dict[str, int] = {"solo": 100, "duo": 50, "trio": 33, "squad": 25}
@@ -214,180 +220,60 @@ RAW_HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <style>
-* { box-sizing: border-box; }
+  :root {
+    --bg:#07080c;
+    --panel:#0d1017;
+    --card:#0b0e14;
+    --line: rgba(255,255,255,.08);
+    --text:#eef1ff;
+    --muted:#b4bbd8;
+    --pill: rgba(255,255,255,.03);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:
+      radial-gradient(1200px 700px at 30% -20%, rgba(255,255,255,.05), transparent 60%),
+      radial-gradient(900px 600px at 90% 0%, rgba(214,178,108,.10), transparent 55%),
+      linear-gradient(180deg, rgba(255,255,255,.03), transparent 35%),
+      var(--bg);
+    color:var(--text);
+    font-family:"Noto Sans JP",system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  .wrap{ width:600px; max-width:600px; margin:0 auto; }
+  .panel{ max-width:600px; margin:0 auto;
+    width:944px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02) 45%, rgba(255,255,255,.01)),
+      var(--panel);
+    border:1px solid var(--line);
+    border-radius:18px;
+    box-shadow:0 18px 55px rgba(0,0,0,.60),0 0 0 1px rgba(0,0,0,.25) inset;
+    overflow:hidden;
+  }
+  .head{padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .head .h{font-size:18px;font-weight:900;letter-spacing:.04em;}
+  .head .d{font-size:12px;color:var(--muted);padding:5px 10px;border:1px solid rgba(255,255,255,.10);border-radius:999px;background:var(--pill);}
+  .list{padding:14px 14px 18px;display:flex;flex-direction:column;gap:12px;}
+  .card{
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)),
+      var(--card);
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:16px;
+    padding:14px 14px 12px;
+    box-shadow:0 10px 26px rgba(0,0,0,.40),0 0 0 1px rgba(255,255,255,.03) inset;
+  }
+  .row{display:flex;align-items:center;gap:10px;font-weight:900;min-width:0}
+  .ico{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;font-size:16px;}
+  .ico.none{opacity:.55}
+  .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:760px;}
+  .tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;font-size:12px;}
+  .tag{background:var(--pill);border:1px solid rgba(255,255,255,.08);border-radius:999px;padding:6px 10px;white-space:nowrap;}
+  .tag b{opacity:.85;}
+  .note{margin-top:10px;color:var(--muted);font-size:12px;line-height:1.45;}
+  .note b{color:var(--text);}
 
-html, body{
-  margin: 0;
-  padding: 0;
-  width: 1280px;
-  height: 720px;
-}
-
-body{
-  font-family:
-    "Noto Sans JP",
-    "Hiragino Sans",
-    "Yu Gothic",
-    "Meiryo",
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    sans-serif;
-  color: #222;
-  background: #ffffff;
-}
-
-/* ===== 全体 ===== */
-.app{
-  position: absolute;
-  top: 140px;
-  left: 60px;
-  width: 1000px;
-  display: flex;
-  flex-direction: column;
-  gap: 34px;
-}
-
-/* ===== 試合目 ===== */
-.match-box p{
-  position: relative;
-  display: inline-block;
-  padding: 10px 1.2em;
-  margin: 0;
-
-  font-size: 26px;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  color: #111;
-}
-
-.match-box p::before,
-.match-box p::after{
-  content: "";
-  position: absolute;
-  width: 22px;
-  height: 28px;
-}
-
-.match-box p::before{
-  top: 0;
-  left: 0;
-  border-left: 5px solid {accent_color};
-  border-top: 5px solid {accent_color};
-}
-
-.match-box p::after{
-  bottom: 0;
-  right: 0;
-  border-right: 5px solid {accent_color};
-  border-bottom: 5px solid {accent_color};
-}
-
-/* ===== 共通カード ===== */
-.line-card{
-  position: relative;
-  width: 100%;
-  min-height: 180px;
-  border: 5px solid {accent_color};
-  border-radius: 28px;
-
-  background: rgba(255,255,255,0.98);
-  box-shadow: 0 10px 26px rgba(0,0,0,0.12);
-
-  padding: 32px 34px 26px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-}
-
-/* タイトル（下だけ白ベタ） */
-.line-title{
-  position: absolute;
-  top: -22px;
-  left: 30px;
-  padding: 0 12px;
-
-  font-size: 20px;
-  font-weight: 900;
-  color: {accent_color};
-  background: transparent;
-
-  z-index: 2;
-}
-
-.line-title::after{
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 55%;
-  background: #fff;
-  z-index: -1;
-  border-radius: 6px;
-}
-
-/* ===== 2行ブロック共通 ===== */
-.two-line{
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  line-height: 1;
-}
-
-.two-line .main{
-  font-size: 72px;
-  font-weight: 900;
-  letter-spacing: 0.03em;
-  line-height: 1;
-  color: #111;
-}
-
-.two-line .sub{
-  margin-top: 8px;
-  font-size: 16px;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  color: #444;
-  min-height: 1em;
-}
-
-/* ===== 時刻行（予定/確定） ===== */
-.time-row{
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  width: 100%;
-  line-height: 1;
-}
-.time-row-label{
-  font-size: 22px;
-  font-weight: 900;
-  letter-spacing: 0.06em;
-  color: #fff;
-  background: #111;
-  padding: 10px 18px;
-  border-radius: 16px;
-  box-shadow: 0 6px 14px rgba(0,0,0,0.18);
-  white-space: nowrap;
-}
-.time-row-value{
-  font-size: 64px;
-  font-weight: 900;
-  letter-spacing: 0.03em;
-  line-height: 1;
-  color: #111;
-}
-
-/* ===== 注釈 ===== */
-.note-out{
-  margin-top: -18px;
-  padding-left: 20px;
-  font-size: 22px;
-  font-weight: 900;
-  line-height: 1.4;
-  color: #111;
-}
 </style>
 </head>
 
@@ -402,7 +288,7 @@ body{
       <span class="line-title">🔒カスタムキー</span>
       <div class="two-line">
         <div class="main">{key_value}</div>
-        <div class="sub"> </div>
+        
       </div>
     </div>
 
@@ -524,36 +410,16 @@ def _read_today_scrim_events_from_db(today_ymd: str) -> List[Dict[str, Any]]:
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
-
-    try:
-        rows = con.execute(
-            """
-            SELECT id, date, title, style, start_time, matches, mode_primary, mode_secondary, composite_json, note
-            FROM events
-            WHERE date = ?
-            ORDER BY start_time, id
-            """,
-            (today_ymd,),
-        ).fetchall()
-    except sqlite3.OperationalError as e:
-        # 典型: DB未初期化で events テーブルが無い
-        msg = str(e)
-        if "no such table" in msg and "events" in msg:
-            try:
-                tbls = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            except Exception:
-                tbls = []
-            print(f"[WARN] scrim_calendar DB has no 'events' table. tables={tbls} db={db_path}")
-            rows = []
-        else:
-            con.close()
-            raise
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
+    rows = con.execute(
+        """
+        SELECT id, date, title, style, start_time, matches, mode_primary, mode_secondary, composite_json, note
+        FROM events
+        WHERE date = ?
+        ORDER BY start_time, id
+        """,
+        (today_ymd,),
+    ).fetchall()
+    con.close()
 
     out: List[Dict[str, Any]] = []
     for r in rows:
@@ -582,41 +448,49 @@ def _read_today_scrim_events_from_db(today_ymd: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _build_today_panel_html(today_ymd: str, events: List[Dict[str, Any]]) -> str:
-    # date badge
-    y, m, d = map(int, today_ymd.split("-"))
-    date_badge = f"{y}/{str(m).zfill(2)}/{str(d).zfill(2)}"
-    updated = fmt_hhmm_jst(utc_now())
+def _build_today_panel_html(
+    today_ymd: str,
+    events: List[Dict[str, Any]],
+    page_no: int = 1,
+    page_total: int = 1,
+) -> str:
+    """
+    Discord投稿用：Webプレビュー版と同一レイアウト（上品ラグジュアリー / 1カラム）
+    - Jinja2は使わずPythonでHTMLを生成する
+    - page_no/page_total は互換用（表示しない）
+    """
+    updated_at = fmt_hhmm_jst(utc_now())
 
-    # KPIs
-    kpi_trad = sum(1 for e in events if e.get("style") == "従来式")
-    kpi_rot = sum(1 for e in events if e.get("style") == "回転式")
-    kpi_none = len(events) - kpi_trad - kpi_rot
-    times = sorted([e.get("start_time") for e in events if e.get("start_time")])
-    kpi_first = times[0] if times else "—"
+    date_badge = today_ymd.replace("-", "/") if isinstance(today_ymd, str) else str(today_ymd)
+    server_name = ""
 
-    # cards
-    cards_html = ""
     if not events:
-        cards_html = '<div class="card"><div class="sub">本日の予定はありません</div></div>'
+        cards_html = ('<div class="card"><div class="sub">本日の予定はありません</div></div>')
+        # (fixed) empty-state card html
     else:
-        parts = []
+        parts: List[str] = []
         for e in events:
             icon = _scrim_panel_icon(e.get("style", ""))
             icon_html = f'<span class="ico">{_html_esc(icon)}</span>' if icon else '<span class="ico none">⚪</span>'
-            title = _html_esc(e.get("title", ""))
-            style = _html_esc(e.get("style", ""))
-            start_time = _html_esc(e.get("start_time", "")) or "未定"
-            mode_primary = _html_esc(e.get("mode_primary", "")) or "—"
-            mode_secondary = _html_esc(e.get("mode_secondary", "")) or "—"
 
-            match_tag = ""
+            title = _html_esc(e.get("title", ""))
+            style = _html_esc(e.get("style", "")) or "登録しない"
+            start = _html_esc(e.get("start_time", "")) or "未定"
+
+            mode1 = _html_esc(e.get("mode_primary", "")) or "—"
+            mode2 = _html_esc(e.get("mode_secondary", "")) or "—"
+
+            tags: List[str] = [
+                f'<span class="tag"><strong>開始</strong> {start}</span>',
+                f'<span class="tag"><strong>方式</strong> {style}</span>',
+            ]
             if e.get("style") == "従来式":
-                match_tag = f'<span class="tag"><strong>試合</strong> {_html_esc(e.get("matches") or 0)}</span>'
+                tags.append(f'<span class="tag"><strong>試合</strong> {_html_esc(e.get("matches") or 0)}</span>')
+            tags.append(f'<span class="tag"><strong>モード</strong> {mode1} / {mode2}</span>')
 
             comp_html = ""
-            if e.get("mode_secondary") == "複合" and e.get("composite"):
-                lines = []
+            if (e.get("mode_secondary") == "複合") and e.get("composite"):
+                lines: List[str] = []
                 for x in e.get("composite", []):
                     if not isinstance(x, dict):
                         continue
@@ -631,164 +505,387 @@ def _build_today_panel_html(today_ymd: str, events: List[Dict[str, Any]]) -> str
                     comp_html = '<div class="note"><b>複合内訳</b><br>' + "<br>".join(lines) + "</div>"
 
             note_html = ""
-            if e.get("note"):
-                note_html = f'<div class="note"><b>備考</b> {_html_esc(e.get("note"))}</div>'
+            note = (e.get("note") or "").strip()
+            if note:
+                note_html = f'<div class="note"><b>備考</b> {_html_esc(note)}</div>'
 
-            parts.append(
-                f'''
-                <div class="card">
-                  <div class="row1">
-                    <div class="name">{icon_html}<span class="truncate">{title}</span></div>
-                  </div>
-                  <div class="meta">
-                    <span class="tag"><strong>開始</strong> {start_time}</span>
-                    <span class="tag"><strong>方式</strong> {style}</span>
-                    {match_tag}
-                    <span class="tag"><strong>モード</strong> {mode_primary} / {mode_secondary}</span>
-                  </div>
-                  {comp_html}
-                  {note_html}
-                </div>
-                '''
+            card = (
+                '<div class="card">'
+                '<div class="row1"><div class="name">'
+                f'{icon_html}'
+                f'<span class="truncate">{title}</span>'
+                '</div></div>'
+                f'<div class="meta">{"".join(tags)}</div>'
+                f'{comp_html}'
+                f'{note_html}'
+                '</div>'
             )
+            parts.append(card)
+
         cards_html = "\n".join(parts)
 
-    # main html
-    return f"""<!doctype html>
+    RAW_TODAY_PANEL_TEMPLATE = """<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>本日のスクリム情報</title>
+
   <style>
-    :root{{
-      --bg:#0b0c10; --card:#11131a; --card2:#0f1117; --line:#232636;
-      --text:#e9ecff; --muted:#aab0d6; --pill:#171a25;
-    }}
-    *{{box-sizing:border-box}}
-    body{{
+    :root{
+      --bg:#07080c;
+      --card:#0d1017;
+      --card2:#0b0e14;
+
+      --text:#eef1ff;
+      --muted:#b4bbd8;
+
+      --line: rgba(255,255,255,.08);
+      --lineSoft: rgba(255,255,255,.06);
+
+      --gold: rgba(214,178,108,.55);
+      --goldSoft: rgba(214,178,108,.20);
+
+      --pill: rgba(255,255,255,.03);
+    }
+
+    *{ box-sizing:border-box }
+
+    body{
       margin:0;
-      background: radial-gradient(1200px 600px at 15% -10%, rgba(122,162,255,.18), transparent 60%),
-                  radial-gradient(800px 500px at 85% 10%, rgba(255,176,32,.12), transparent 55%),
-                  var(--bg);
+      background:
+        radial-gradient(1200px 700px at 30% -20%, rgba(255,255,255,.05), transparent 60%),
+        radial-gradient(900px 600px at 90% 0%, rgba(214,178,108,.10), transparent 55%),
+        linear-gradient(180deg, rgba(255,255,255,.03), transparent 35%),
+        var(--bg);
       color:var(--text);
       font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif;
-      padding:18px;
-    }}
-    .wrap{{max-width:980px;margin:0 auto}}
-    .top{{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}}
-    .title{{display:flex;flex-direction:column;gap:6px}}
-    h1{{margin:0;font-size:20px;letter-spacing:.3px;display:flex;align-items:center;gap:10px}}
-    .badge{{font-size:12px;padding:3px 10px;border-radius:999px;background: rgba(122,162,255,.14);border:1px solid rgba(122,162,255,.30);color: var(--text);}}
-    .sub{{color:var(--muted);font-size:12px;line-height:1.4}}
-    .legend{{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;font-size:12px;color:var(--muted)}}
-    .legend span{{background:var(--pill);border:1px solid var(--line);padding:4px 10px;border-radius:999px}}
+      padding:10px;
+    }
 
-    .grid{{display:grid;grid-template-columns: 1.2fr .8fr;gap:12px;align-items:start}}
-    .panel{{background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 40%), var(--card);
-      border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow: 0 10px 35px rgba(0,0,0,.35);}}
-    .panelHead{{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;background: rgba(255,255,255,.02);}}
-    .panelHead b{{font-size:13px}}
-    .panelHead .right{{font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}
-    .pill{{background:var(--pill);border:1px solid var(--line);padding:4px 10px;border-radius:999px;color:var(--muted)}}
+    
 
-    .list{{padding:12px;display:flex;flex-direction:column;gap:10px}}
-    .card{{background: var(--card2);border:1px solid var(--line);border-radius:14px;padding:12px}}
-    .row1{{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}}
-    .name{{font-size:14px;font-weight:900;line-height:1.25;display:flex;align-items:center;gap:8px;min-width:0}}
-    .name .truncate{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}}
-    .meta{{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--muted)}}
-    .tag{{border:1px solid var(--line);background: rgba(255,255,255,.02);padding:4px 10px;border-radius:999px}}
-    .tag strong{{color:var(--text)}}
-    .note{{margin-top:10px;font-size:12px;color:var(--muted);line-height:1.45;border-top:1px dashed rgba(170,176,214,.25);padding-top:10px}}
-    .note b{{color:var(--text)}}
+    .wrap{ width:600px; margin:0; }
+/* Discord用：左右の“半分空き”を無くす */
+/* ===== 上部（横に散らさず、1ブロック化） ===== */
+    .top{
+      display:flex;
+      flex-direction:column;
+      align-items:flex-start;
+      justify-content:flex-start;
+      gap:4px;
+      margin-bottom:10px;
+      position:relative;
+      padding-bottom:8px;
+    }
+    .top::after{
+      content:"";
+      position:absolute;
+      left:0; right:0; bottom:0;
+      height:1px;
+      background: linear-gradient(90deg, transparent, rgba(214,178,108,.35), transparent);
+    }
 
-    .kpi{{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}}
-    .stat{{background: rgba(255,255,255,.02);border:1px solid var(--line);border-radius:14px;padding:12px}}
-    .stat .label{{font-size:12px;color:var(--muted)}}
-    .stat .value{{font-size:20px;font-weight:900;margin-top:6px}}
-    .stat .hint{{font-size:12px;color:var(--muted);margin-top:4px}}
+    .title{ display:flex; flex-direction:column; gap:4px }
 
-    .ico{{font-size:16px;line-height:1}}
-    .ico.none{{opacity:.6}}
+    h1{
+      margin:0;
+      font-size:22px;
+      letter-spacing:.7px;
+      display:flex;
+      align-items:center;
+      gap:10px;
+      text-shadow: 0 10px 30px rgba(0,0,0,.45);
+    }
 
-    @media (max-width: 860px){{ .grid{{grid-template-columns:1fr}} }}
+    .badge{
+      font-size:12px;
+      padding:4px 10px;
+      border-radius:999px;
+      background: linear-gradient(180deg, rgba(214,178,108,.24), rgba(214,178,108,.10));
+      border:1px solid rgba(214,178,108,.28);
+      box-shadow: 0 10px 25px rgba(0,0,0,.35);
+    }
+
+    .sub{
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.35;
+    }
+
+    .legend{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      justify-content:flex-start;
+      font-size:12px;
+      color:var(--muted);
+    }
+    .legend span{
+      background: rgba(255,255,255,.025);
+      border:1px solid var(--lineSoft);
+      padding:4px 10px;
+      border-radius:999px;
+    }
+
+    /* ===== レイアウト ===== */
+    .grid{
+      display:grid;
+      grid-template-columns:1fr;
+      gap:10px;
+    }
+
+    /* ===== パネル ===== */
+    .panel{
+      position:relative;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02) 45%, rgba(255,255,255,.01)),
+        var(--card);
+      border:1px solid var(--line);
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow:
+        0 18px 55px rgba(0,0,0,.60),
+        0 0 0 1px rgba(0,0,0,.25) inset;
+    }
+    .panel::before{
+      content:"";
+      position:absolute;
+      inset:0;
+      background:
+        radial-gradient(900px 200px at 20% 0%, rgba(255,255,255,.10), transparent 60%),
+        radial-gradient(800px 220px at 85% 0%, rgba(214,178,108,.10), transparent 62%);
+      opacity:.55;
+      pointer-events:none;
+    }
+
+    .panelHead{
+      padding:10px 12px;
+      border-bottom:1px solid var(--lineSoft);
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.015));
+    }
+    .panelHead b{
+      font-size:13px;
+      letter-spacing:.7px;
+    }
+
+    .pill{
+      background: var(--pill);
+      border:1px solid var(--lineSoft);
+      border-radius:999px;
+      padding:4px 10px;
+      font-size:11px;
+      color:var(--muted);
+      opacity:.65;
+    }
+
+    /* ===== カード（1件用：余白を詰める） ===== */
+    .list{
+      padding:10px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+
+    .card{
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)),
+        var(--card2);
+      border:1px solid var(--lineSoft);
+      border-radius:16px;
+      padding:10px;
+      box-shadow:
+        0 10px 26px rgba(0,0,0,.40),
+        0 0 0 1px rgba(255,255,255,.03) inset;
+    }
+
+    .row1{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+    }
+
+    .name{
+      font-size:15px;
+      font-weight:900;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      min-width:0;
+    }
+    .truncate{
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .ico{ font-size:16px }
+    .ico.none{ opacity:.5 }
+
+    .meta{
+      margin-top:8px;
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+      font-size:12px;
+      color:var(--muted);
+    }
+
+    .tag{
+      background: var(--pill);
+      border:1px solid var(--lineSoft);
+      border-radius:999px;
+      padding:4px 10px;
+    }
+    .tag strong{ color:var(--text) }
+
+    .note{
+      margin-top:10px;
+      font-size:12px;
+      color:var(--muted);
+      line-height:1.45;
+      border-top:1px dashed rgba(255,255,255,.15);
+      padding-top:10px;
+    }
+
+    /* Discord用：フッターは出さない */
+    .footer{ display:none; }
   </style>
 </head>
+
 <body>
-  <div class="wrap">
-    <div class="top">
-      <div class="title">
-        <h1>本日のスクリム情報 <span class="badge">{_html_esc(date_badge)}</span></h1>
-        <div class="sub">🟠 回転式｜🔵 従来式｜（方式「登録しない」はアイコン無し）</div>
-      </div>
-      <div class="legend">
-        <span>更新: <b>{_html_esc(updated)}</b></span>
-        <span>予定数: <b>{len(events)}</b></span>
-        <span>表示: スクリム名 / モード / 時間 / 試合数 / 備考</span>
-      </div>
-    </div>
+<div class="wrap">
+</div>
+</div>
 
-    <div class="grid">
-      <div class="panel">
-        <div class="panelHead">
-          <b>今日の予定</b>
-          <div class="right"><span class="pill">JP</span><span class="pill">Discord用</span></div>
-        </div>
-        <div class="list">
-          {cards_html}
-        </div>
+  <div class="grid">
+    <div class="panel">
+      <div class="panelHead">
+        <b>本日のスクリム情報 {date_badge}</b>
+        
       </div>
 
-      <div class="panel">
-        <div class="panelHead"><b>サマリー</b><div class="right"><span class="pill">集計</span></div></div>
-        <div class="kpi">
-          <div class="stat"><div class="label">従来式 🔵</div><div class="value">{kpi_trad}</div><div class="hint">試合数があるタイプ</div></div>
-          <div class="stat"><div class="label">回転式 🟠</div><div class="value">{kpi_rot}</div><div class="hint">回転式 / 形式固定なし</div></div>
-          <div class="stat"><div class="label">登録しない</div><div class="value">{kpi_none}</div><div class="hint">アイコン無しで表示</div></div>
-          <div class="stat"><div class="label">最初の開始</div><div class="value">{_html_esc(kpi_first)}</div><div class="hint">時間未入力は除外</div></div>
-        </div>
-        <div class="list" style="padding-top:0">
-          <div class="card">
-            <div class="row1"><div class="name"><span class="ico">📌</span><span class="truncate">自動生成</span></div></div>
-            <div class="note"><b>DB</b> { _html_esc(SCRIM_CALENDAR_DB_PATH) }</div>
-          </div>
-        </div>
+      <div class="list">
+        {cards_html}
       </div>
     </div>
   </div>
+
+  <div class="footer">
+    <span class="smallPill">Tip: タイトルが長い場合は自動で省略表示</span>
+    <span class="smallPill">表示内容は運用に合わせて調整可能</span>
+  </div>
+
+</div>
 </body>
-</html>"""
+</html>
+"""
+
+    return _build_html(
+        RAW_TODAY_PANEL_TEMPLATE,
+        date_badge=_html_esc(date_badge),
+        updated_at=_html_esc(updated_at),
+        count=str(len(events)),
+        server_name=_html_esc(server_name),
+        cards_html=cards_html,
+    )
 
 
-async def _try_render_png_from_html_panel(html: str, width: int = 980, height: int = 820) -> Optional[bytes]:
+async def _try_render_png_from_html_panel(html: str) -> Optional[bytes]:
+    """Render HTML -> PNG (Discord用): 横幅600px厳守で.panelを切り抜く"""
     try:
         from playwright.async_api import async_playwright
     except Exception:
         return None
 
+    html_path = None
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch()
-            page = await browser.new_page(viewport={"width": int(width), "height": int(height)})
+            page = await browser.new_page(viewport={"width": 600, "height": 900}, device_scale_factor=2)
+
             with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
                 f.write(html)
                 html_path = f.name
+
             await page.goto("file://" + html_path)
             try:
-                await page.wait_for_timeout(250)
+                await page.wait_for_selector(".panel", timeout=2000)
             except Exception:
                 pass
-            png = await page.screenshot(type="png")
+            await page.wait_for_timeout(200)
+
+            panel = page.locator(".panel")
+            box = await panel.bounding_box()
+            if not box:
+                png = await page.screenshot(type="png")
+                await browser.close()
+                return png
+
+            pad = 12
+            x = max(0, int(box["x"]) - pad)
+            y = max(0, int(box["y"]) - pad)
+            h = int(box["height"]) + pad * 2
+
+            png = await page.screenshot(
+                type="png",
+                clip={
+                    "x": 0,
+                    "y": y,
+                    "width": 600,
+                    "height": h,
+                },
+            )
             await browser.close()
-        try:
-            os.remove(html_path)
-        except Exception:
-            pass
-        return png
+            return png
     except Exception as e:
         print(f"[WARN] today panel render failed: {e}")
         return None
+    finally:
+        if html_path:
+            try:
+                os.remove(html_path)
+            except Exception:
+                pass
+
+def _chunk_list(items: List[Any], n: int) -> List[List[Any]]:
+    if n <= 0:
+        n = 1
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
+async def render_today_scrim_panel_png_pages(
+    today_ymd: Optional[str] = None,
+    *,
+    max_events_per_page: Optional[int] = None,
+) -> List[bytes]:
+    """今日の予定を、N件ごとに分割して PNG(bytes) のリストで返す"""
+    if not today_ymd:
+        today_ymd = jst_date_str(utc_now())
+
+    if max_events_per_page is None:
+        max_events_per_page = TODAY_PANEL_MAX_EVENTS_PER_PAGE
+    if max_events_per_page <= 0:
+        max_events_per_page = 1
+
+    events = _read_today_scrim_events_from_db(today_ymd)
+    pages = _chunk_list(events, int(max_events_per_page))
+    if not pages:
+        pages = [[]]
+
+    out: List[bytes] = []
+    total = len(pages)
+    for idx, evs in enumerate(pages, start=1):
+        html = _build_today_panel_html(today_ymd, evs, page_no=idx, page_total=total)
+        png = await _try_render_png_from_html_panel(html)
+        if not png:
+            raise RuntimeError("panel render failed (playwright not available?)")
+        out.append(png)
+    return out
 
 
 async def render_today_scrim_panel_png(today_ymd: Optional[str] = None) -> bytes:
@@ -900,23 +997,6 @@ async def img_key_ephemeral(match_no: int, key_value: str):
     html = build_key_image_html(f"{match_no}試合目", key_value, "")
     return await _try_render_png_from_html_key(html)
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page(viewport={"width": 1280, "height": 720})
-            with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
-                f.write(html)
-                html_path = f.name
-            await page.goto("file://" + html_path)
-            png = await page.screenshot(type="png")
-            await browser.close()
-        try:
-            os.remove(html_path)
-        except Exception:
-            pass
-        return png
-    except Exception:
-        return None
 
 
 
@@ -1747,6 +1827,8 @@ class ScrimBot(commands.Bot):
                 pass
 
     async def on_ready(self):
+        for g in self.guilds:
+            await self.tree.sync(guild=discord.Object(id=g.id))
         if self._scheduler_task is None or self._scheduler_task.done():
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         try:
@@ -1806,39 +1888,40 @@ class ScrimBot(commands.Bot):
             m.thread_delete_at = None
             await self._save_all()
 
-    async def _auto_post_today_panel_if_due(self):
-        if not AUTOPOST_TODAY_PANEL:
-            return
+async def _auto_post_today_panel_if_due(self):
+    if not AUTOPOST_TODAY_PANEL:
+        return
 
-        now = utc_now()
-        now_jst = to_jst(now)
-        if (now_jst.hour, now_jst.minute) != (AUTOPOST_HOUR_JST, AUTOPOST_MINUTE_JST):
-            return
+    now = utc_now()
+    now_jst = to_jst(now)
+    if (now_jst.hour, now_jst.minute) != (AUTOPOST_HOUR_JST, AUTOPOST_MINUTE_JST):
+        return
 
-        today = jst_date_str(now)
+    today = jst_date_str(now)
 
-        for guild in list(self.guilds):
-            if self._today_panel_last_post.get(guild.id) == today:
-                continue
+    for guild in list(self.guilds):
+        if self._today_panel_last_post.get(guild.id) == today:
+            continue
 
-            gch = await self.get_global_channel(guild)
-            if not gch:
-                continue
+        gch = await self.get_global_channel(guild)
+        if not gch:
+            continue
 
-            try:
-                png = await render_today_scrim_panel_png(today)
-            except Exception as e:
-                print(f"[AUTOPOST] render failed ({guild.id}): {e}")
-                continue
+        try:
+            pages = await render_today_scrim_panel_png_pages(today)
+        except Exception as e:
+            print(f"[AUTOPOST] render failed ({guild.id}): {e}")
+            continue
 
-            try:
-                file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
-                await gch.send(content="📅【本日のスクリム情報】（自動投稿）", file=file)
-                self._today_panel_last_post[guild.id] = today
-            except Exception as e:
-                print(f"[AUTOPOST] send failed ({guild.id}): {e}")
-                continue
-
+        try:
+            # 画像のみ投稿（余計なテキストやページ番号は一切送らない）
+            for i, png in enumerate(pages, start=1):
+                file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_{i:02d}.png")
+                await gch.send(file=file)
+            self._today_panel_last_post[guild.id] = today
+        except Exception as e:
+            print(f"[AUTOPOST] send failed ({guild.id}): {e}")
+            continue
 
     # ---------- full reset ----------
     async def _full_reset_guild(self, guild: discord.Guild):
@@ -1961,82 +2044,53 @@ class ScrimBot(commands.Bot):
         # =====================
         # Posting: Today Scrim Panel (command)
         # =====================
-        @self.tree.command(name="scrim_today", description="本日のスクリム情報を画像で投稿")
-        async def scrim_today(interaction: discord.Interaction):
-            # 先に応答してタイムアウト回避
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer(thinking=False)
-            except Exception:
-                pass
+        # (removed legacy tree.command scrim_today: use app_commands Cog version)
 
-            try:
-                png = await render_today_scrim_panel_png()
-            except Exception as e:
-                msg = f"本日のスクリム情報の生成に失敗しました: {e}"
-                try:
-                    if interaction.response.is_done():
-                        await interaction.followup.send(msg, ephemeral=True)
-                    else:
-                        await interaction.response.send_message(msg, ephemeral=True)
-                except Exception:
-                    pass
-                return
+@self.tree.command(name="scrim_today_preview", description="本日のスクリム情報（プレビュー）を画像のみで投稿")
+async def scrim_today_preview(interaction: discord.Interaction):
+    # コマンド実行ログ（「○○さんがコマンドを使用しました」）を出さないため、
+    # 最初の応答はephemeralで握り、実際の投稿はチャンネルへ直接送信する。
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
 
-            file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(content="📅【本日のスクリム情報】", file=file)
-                else:
-                    await interaction.response.send_message(content="📅【本日のスクリム情報】", file=file)
-            except Exception:
-                if interaction.channel:
-                    await interaction.channel.send(content="📅【本日のスクリム情報】", file=file)
+    try:
+        pages = await render_today_scrim_panel_png_pages()
+    except Exception as e:
+        msg = f"プレビュー生成に失敗しました: {e}\nDB: {SCRIM_CALENDAR_DB_PATH}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # 画像のみ投稿（テキストは一切付けない）
+    try:
+        for i, png in enumerate(pages, start=1):
+            file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
+            await interaction.channel.send(file=file)  # type: ignore
+    except Exception:
+        # 失敗しても極力投稿
+        if interaction.channel:
+            for i, png in enumerate(pages, start=1):
+                file = discord.File(fp=io.BytesIO(png), filename=f"today_scrim_preview_{i:02d}.png")
+                await interaction.channel.send(file=file)  # type: ignore
+
+    # エフェメラル応答を掃除（あれば）
+    try:
+        await interaction.delete_original_response()
+    except Exception:
+        pass
 
 
-        @self.tree.command(name="scrim_today_preview", description="本日のスクリム情報（プレビュー）を画像で表示")
-        async def scrim_today_preview(interaction: discord.Interaction):
-            # 管理者（サーバー管理）だけ実行可
-            try:
-                if interaction.guild and (not interaction.user.guild_permissions.manage_guild):
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message("権限がありません（サーバー管理権限が必要です）。", ephemeral=True)
-                    else:
-                        await interaction.followup.send("権限がありません（サーバー管理権限が必要です）。", ephemeral=True)
-                    return
-            except Exception:
-                pass
-
-            # 先に応答してタイムアウト回避（ephemeral）
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer(ephemeral=True, thinking=False)
-            except Exception:
-                pass
-
-            try:
-                png = await render_today_scrim_panel_png()
-            except Exception as e:
-                msg = f"本日のスクリム情報（プレビュー）の生成に失敗しました: {e}"
-                try:
-                    if interaction.response.is_done():
-                        await interaction.followup.send(msg, ephemeral=True)
-                    else:
-                        await interaction.response.send_message(msg, ephemeral=True)
-                except Exception:
-                    pass
-                return
-
-            file = discord.File(fp=io.BytesIO(png), filename="today_scrim_preview.png")
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(content="🧪【本日のスクリム情報｜プレビュー】", file=file, ephemeral=True)
-                else:
-                    await interaction.response.send_message(content="🧪【本日のスクリム情報｜プレビュー】", file=file, ephemeral=True)
-            except Exception:
-                # 最終フォールバック（チャンネルに投げない：プレビューのため）
-                pass
-
+    # =====================
+    # Posting
+    # =====================
 
 
 def main():
@@ -2050,3 +2104,44 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+
+# =====================
+# Scrim Today Test Cog
+# =====================
+class ScrimTodayCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(
+        name="scrim_today",
+        description="本日のスクリム情報を画像で投稿（テスト用）"
+    )
+    async def scrim_today(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
+
+        try:
+            pages = await render_today_scrim_panel_png_pages()
+        except Exception as e:
+            await interaction.followup.send(f"生成失敗: {e}", ephemeral=True)
+            return
+
+        for png, style in pages:
+            file = discord.File(fp=io.BytesIO(png), filename="today_scrim.png")
+            view = None
+            if style == "従来式":
+                view = TodayTraditionalButtons(self.bot)
+            elif style == "回転式":
+                view = TodayRotationButtons(self.bot)
+
+            await interaction.channel.send(file=file, view=view)
+
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ScrimTodayCog(bot))
