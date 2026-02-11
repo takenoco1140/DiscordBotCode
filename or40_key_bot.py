@@ -1,3 +1,4 @@
+from __future__ import annotations
 automation_loop_task = None
 _last_ops_header_refresh_minute = None  # 'YYYY-MM-DD HH:MM'
 # -*- coding: utf-8 -*-
@@ -23,7 +24,7 @@ import json
 import random
 import asyncio
 from dataclasses import dataclass, asdict, fields, field
-from datetime import datetime, timezone, timedelta, timedelta
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional, Set, List
 
 import discord
@@ -116,7 +117,7 @@ JST = timezone(timedelta(hours=9))
 def now_jst() -> datetime:
     return datetime.now(tz=JST)
 
-def parse_hhmm(hhmm_str: str, base: Optional[datetime] = None) -> datetime:
+def parse_hhmm_dt(hhmm_str: str, base: Optional[datetime] = None) -> datetime:
     base = base or now_jst()
     h, m = hhmm_str.split(":")
     return base.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
@@ -125,8 +126,8 @@ def is_in_pause_window(now: datetime) -> bool:
     if not STATE.key_pause_from or not STATE.key_pause_to:
         return False
     try:
-        start = parse_hhmm(STATE.key_pause_from, now)
-        end = parse_hhmm(STATE.key_pause_to, now)
+        start = parse_hhmm_dt(STATE.key_pause_from, now)
+        end = parse_hhmm_dt(STATE.key_pause_to, now)
         return start <= now < end
     except Exception:
         return False
@@ -144,6 +145,51 @@ def apply_map_remaining_minutes(now: datetime, remaining_min: int) -> None:
 
     # 停止帯：1試合目は切替前7分未満〜切替、2試合目以降は切替前4分未満〜切替
     lead = 7 if int(getattr(STATE, "match_no", 1) or 1) == 1 else 4
+    pause_from = switch_dt - timedelta(minutes=lead)
+    pause_to = switch_dt
+    STATE.key_pause_from = pause_from.strftime("%H:%M")
+    STATE.key_pause_to = pause_to.strftime("%H:%M")
+    save_state(STATE)
+
+
+def recompute_pause_window_from_state(now: Optional[datetime] = None) -> None:
+    """Recompute key pause window from STATE.map_switch_time / STATE.map_remaining_min and STATE.match_no.
+
+    Used when match_no changes after remaining minutes were entered.
+    """
+    now = now or now_jst()
+    try:
+        match_no = int(getattr(STATE, "match_no", 1) or 1)
+    except Exception:
+        match_no = 1
+
+    switch_dt = None
+
+    # Prefer explicit switch time
+    sw = (getattr(STATE, "map_switch_time", None) or "").strip()
+    if sw:
+        try:
+            switch_dt = parse_hhmm(sw, now)
+        except Exception:
+            switch_dt = None
+
+    # Fallback: remaining minutes (should normally also set map_switch_time)
+    if switch_dt is None:
+        rem = getattr(STATE, "map_remaining_min", None)
+        if rem is not None:
+            try:
+                rem = max(0, int(rem))
+                switch_dt = now + timedelta(minutes=rem)
+                hhmm_val = switch_dt.strftime("%H:%M")
+                STATE.map_switch_hhmm = hhmm_val
+                STATE.map_switch_time = hhmm_val
+            except Exception:
+                switch_dt = None
+
+    if switch_dt is None:
+        return
+
+    lead = 7 if match_no == 1 else 4
     pause_from = switch_dt - timedelta(minutes=lead)
     pause_to = switch_dt
     STATE.key_pause_from = pause_from.strftime("%H:%M")
@@ -194,9 +240,28 @@ def _parse_event_date_to_date(s: str) -> Optional[date]:
 
 
 def is_event_day(now: Optional[datetime] = None) -> bool:
-    # True only when today's date (JST) matches entry-bot event_date.
-    # If event_date is not configured or cannot be loaded, returns False (safe).
+    # True only when today's date (JST) matches the configured event day.
+    #
+    # Priority:
+    # 1) If STATE.display_date_override is set (YYYY-MM-DD), treat that as the event day (test run).
+    # 2) Otherwise, use entry-bot panel_state.json event_date/date.
+    #
+    # If nothing is configured or parsing fails, returns False (safe).
     now = now or now_jst()
+
+    # 1) Test override (display_date_override) — also governs automation start day.
+    try:
+        ov = (getattr(STATE, "display_date_override", None) or "").strip()
+    except Exception:
+        ov = ""
+    if ov:
+        try:
+            d = _parse_event_date_to_date(ov)
+            return bool(d and now.date() == d)
+        except Exception:
+            return False
+
+    # 2) Entry-bot configured event day
     cfg = load_entry_panel_state()
     ev = cfg.get("event_date") or cfg.get("date") or ""
     evd = _parse_event_date_to_date(ev)
@@ -318,7 +383,7 @@ def generate_key(used: Set[str]) -> str:
     return f"OR40{random.randint(0, 9999):04d}"
 
 
-def parse_hhmm(s: str) -> Optional[str]:
+def parse_hhmm_str(s: str) -> Optional[str]:
     s = (s or "").strip()
     if len(s) == 5 and s[2] == ":" and s[:2].isdigit() and s[3:].isdigit():
         hh = int(s[:2]); mm = int(s[3:])
@@ -342,6 +407,9 @@ class BotState:
     match_count: int = DEFAULT_MATCH_COUNT
     match1_start: str = DEFAULT_MATCH1_START
 
+
+    # display (test override)
+    display_date_override: Optional[str] = None   # YYYY-MM-DD (表示用テスト)
     # progress
     match_no: int = 1
     phase: str = "INIT"  # INIT | PREP | KEYHOST_SENT | DEPART_CONFIRMED | IN_MATCH | WAIT_REPLAY | ENDED
@@ -473,7 +541,7 @@ def load_entry_tournament_start_time() -> str:
             or data.get("tournament_start_time_hhmm")
             or ""
         )
-        v = parse_hhmm(str(v))
+        v = parse_hhmm_str(str(v))
         return v or "22:00"
     except Exception:
         return "22:00"
@@ -519,9 +587,12 @@ def reset_to_before_match1() -> None:
     STATE.match_no = 1
     STATE.phase = "INIT"
 
+
+    # display date override reset
+    STATE.display_date_override = None
     STATE.custom_key = None
     # ★大会開始時間を内部初期値として入れる
-    STATE.planned_departure = None  # 未設定
+    STATE.planned_departure = load_entry_tournament_start_time()  # 1試合目のキー配布予定（大会開始）
     STATE.departure_time = None
 
     # map switch / pause
@@ -1520,14 +1591,8 @@ def build_ops_embed() -> discord.Embed:
 
     # マップ切替（指定：切替時間残り｜）
     sw = (getattr(s, "map_switch_time", None) or "").strip()
-    rem = getattr(s, "map_remaining_min", None)
-    rem_txt = f"{rem}分" if rem is not None else ""
-    if sw and rem_txt:
-        switch_remaining = f"{sw} / {rem_txt}"
-    elif sw:
+    if sw:
         switch_remaining = sw
-    elif rem_txt:
-        switch_remaining = rem_txt
     else:
         switch_remaining = "未設定"
 
@@ -1536,6 +1601,31 @@ def build_ops_embed() -> discord.Embed:
 
     mode_label = "ソロ（リロード）" if getattr(s, "mode", "") == "reload" else "ソロ"
     match1 = load_entry_match1_start_time()
+
+    # 設定日（EntryBotの event_date を "2月15日(日)" 形式に）
+    # 設定日（表示用）：基本は大会日。テスト時は display_date_override を優先。
+    setting_date = "未設定"
+    try:
+        d_base = get_event_date()
+        d_show = d_base
+        is_test = False
+        ov = (getattr(STATE, "display_date_override", None) or "").strip()
+        if ov:
+            try:
+                d_show = _parse_event_date_to_date(ov)
+                is_test = True
+            except Exception:
+                # 不正なら無視して大会日へ
+                d_show = d_base
+                is_test = False
+
+        if d_show:
+            _w = ["月","火","水","木","金","土","日"][d_show.weekday()]
+            setting_date = f"{d_show.month}月{d_show.day}日({_w})"
+            if is_test:
+                setting_date += " ※テスト"
+    except Exception:
+        setting_date = "未設定"
 
     e = discord.Embed(title="🍀進捗確認＆緊急用パネル", color=ORANGE)
 
@@ -1553,6 +1643,7 @@ def build_ops_embed() -> discord.Embed:
         "ーーーーーーーーーーーーーーーーーー\n"
         f"⏳未操作：{unop_txt}\n\n"
         "🔫大会情報\n"
+        f"設定日｜{setting_date}\n"
         f"モード｜{mode_label}\n"
         f"試合数｜{s.match_count}\n"
         f"第1試合開始時間｜{match1}（予定）"
@@ -1737,6 +1828,7 @@ class OpsPanelView(discord.ui.View):
     @discord.ui.button(label="1試合目", style=discord.ButtonStyle.secondary, row=1, custom_id="match_1")
     async def match_1(self, interaction: discord.Interaction, button: discord.ui.Button):
         STATE.match_no = 1
+        recompute_pause_window_from_state(now_jst())
         save_state(STATE)
         await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
@@ -1744,6 +1836,7 @@ class OpsPanelView(discord.ui.View):
     @discord.ui.button(label="2試合目", style=discord.ButtonStyle.secondary, row=1, custom_id="match_2")
     async def match_2(self, interaction: discord.Interaction, button: discord.ui.Button):
         STATE.match_no = 2
+        recompute_pause_window_from_state(now_jst())
         save_state(STATE)
         await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
@@ -1751,6 +1844,7 @@ class OpsPanelView(discord.ui.View):
     @discord.ui.button(label="3試合目", style=discord.ButtonStyle.secondary, row=1, custom_id="match_3")
     async def match_3(self, interaction: discord.Interaction, button: discord.ui.Button):
         STATE.match_no = 3
+        recompute_pause_window_from_state(now_jst())
         save_state(STATE)
         await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
@@ -1758,6 +1852,7 @@ class OpsPanelView(discord.ui.View):
     @discord.ui.button(label="4試合目", style=discord.ButtonStyle.secondary, row=1, custom_id="match_4")
     async def match_4(self, interaction: discord.Interaction, button: discord.ui.Button):
         STATE.match_no = 4
+        recompute_pause_window_from_state(now_jst())
         save_state(STATE)
         await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
@@ -1790,6 +1885,10 @@ class OpsPanelView(discord.ui.View):
 
         await update_ops_panel_guild(interaction.guild)
         msg = "OK：キーを配布しました（キーホスト宛）。" if ok else "送信に失敗しました（送信先/権限を確認）"
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="リプレイデータ提出依頼", style=discord.ButtonStyle.primary, row=2, custom_id="replay_request")
     async def replay_request(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1814,6 +1913,62 @@ class OpsPanelView(discord.ui.View):
         save_state(STATE)
         await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
+
+
+    # --------------------------
+    # Row4: 設定日（テスト表示） override
+    # --------------------------
+    @discord.ui.button(label="🧪 設定日(テスト)", style=discord.ButtonStyle.secondary, row=4, custom_id="display_date_set")
+    async def display_date_set(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(DisplayDateSetModal())
+        except Exception:
+            try:
+                await interaction.response.send_message("エラー：モーダルを開けませんでした。", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="🔄 設定日リセット", style=discord.ButtonStyle.secondary, row=4, custom_id="display_date_reset")
+    async def display_date_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            STATE.display_date_override = None
+            save_state(STATE)
+            await update_ops_panel_guild(interaction.guild)
+            await interaction.response.send_message("OK：設定日を大会日に戻しました。", ephemeral=True)
+        except Exception:
+            try:
+                await interaction.response.send_message("エラー：設定日リセットに失敗しました。", ephemeral=True)
+            except Exception:
+                pass
+
+
+
+class DisplayDateSetModal(discord.ui.Modal, title="テスト設定日（表示用）"):
+    date_str = discord.ui.TextInput(
+        label="テストしたい日付（YYYY-MM-DD）",
+        placeholder="例：2026-02-10",
+        required=True,
+        max_length=10,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.date_str.value or "").strip()
+        # 厳密：YYYY-MM-DD
+        ok = False
+        try:
+            d = _parse_event_date_to_date(raw)  # 既存のパーサを流用
+            ok = d is not None
+        except Exception:
+            ok = False
+
+        if not ok:
+            await interaction.response.send_message("エラー：YYYY-MM-DD 形式で入力してください。", ephemeral=True)
+            return
+
+        STATE.display_date_override = raw
+        save_state(STATE)
+        await update_ops_panel_guild(interaction.guild)
+        await interaction.response.send_message(f"OK：設定日を {raw}（※テスト）に切り替えました。", ephemeral=True)
 
 
 class ReplayRequestNumbersModal(discord.ui.Modal, title="提出対象番号（3桁）"):
@@ -2270,6 +2425,17 @@ class ReplaySubmitView(discord.ui.View):
             pass
 
         await self._notify_ops(interaction.guild, f"第{self.match_no}試合 {self.number} 提出完了")
+        # match2 special: give 5 min break then deliver match3 key to keyhost
+        if int(self.match_no) == 2:
+            try:
+                await schedule_match3_break_after_match2_replay(interaction.guild)
+            except Exception:
+                pass
+            return
+
+
+
+
         await self._after_submit_common(interaction)
 
     @discord.ui.button(label="サイズ超過", style=discord.ButtonStyle.secondary, custom_id="replay_submit_size_over")
@@ -2321,10 +2487,8 @@ class ReplaySubmitView(discord.ui.View):
             if isinstance(ch, discord.TextChannel):
                 try:
                     await ch.send(
-                        "運営からの連絡
-"
-                        f"第{self.match_no}試合のリプレイデータ提出のご協力をお願いします。
-"
+                        "運営からの連絡"
+                        f"第{self.match_no}試合のリプレイデータ提出のご協力をお願いします。"
                         f"（対象：{target_rank} {target_number}）"
                     )
                     # advance stage only when we actually sent
@@ -2332,8 +2496,7 @@ class ReplaySubmitView(discord.ui.View):
                     save_state(STATE)
                     await _send_ops_notify(
                         interaction.guild,
-                        f"{ops_mention}
-第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank}（{target_number}）へ連絡しました。"
+                        f"{ops_mention}\n第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank}（{target_number}）へ連絡しました。"
                     )
                     return
                 except Exception:
@@ -2342,16 +2505,14 @@ class ReplaySubmitView(discord.ui.View):
             # channel not found / send failed
             await _send_ops_notify(
                 interaction.guild,
-                f"{ops_mention}
-第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank}（{target_number}）へ連絡できません（チャンネル未検出/送信失敗）。"
+                f"{ops_mention}\n第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank}（{target_number}）へ連絡できません（チャンネル未検出/送信失敗）。"
             )
             return
 
         # not configured for this stage (blank)
         await _send_ops_notify(
             interaction.guild,
-            f"{ops_mention}
-第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank} の番号が未設定です（空欄）。"
+            f"{ops_mention}\n第{self.match_no}試合 {self.number}：リプレイ取り忘れ → {target_rank} の番号が未設定です（空欄）。"
         )
 
 
@@ -2365,15 +2526,25 @@ class MapRemainingModal(discord.ui.Modal, title="マップ切替 残り時間（
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        # モーダル送信は3秒制限が厳しいので、先にACKしてから処理する（KEY DROP が考え中...対策）
+        await silent_ack(interaction)
+
         raw = str(self.remaining.value).strip()
         try:
             m = int(raw)
         except Exception:
-            await silent_ack(interaction)
             return
+
         apply_map_remaining_minutes(now_jst(), m)
-        await update_ops_panel(interaction)
-        await silent_ack(interaction)
+
+        # パネル更新（guild 優先）
+        try:
+            if interaction.guild is not None:
+                await update_ops_panel_guild(interaction.guild)
+            else:
+                await update_ops_panel_guild(interaction.guild)
+        except Exception:
+            pass
 
 
 
@@ -2387,13 +2558,13 @@ class Match1StartModal(discord.ui.Modal, title="第1試合開始時間（HH:MM�
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        v = parse_hhmm(str(self.hhmm.value))
+        v = parse_hhmm_str(str(self.hhmm.value))
         if not v:
             await silent_ack(interaction)
             return
         STATE.match1_start = v
         save_state(STATE)
-        await update_ops_panel(interaction)
+        await update_ops_panel_guild(interaction.guild)
         await silent_ack(interaction)
 
 
@@ -2536,14 +2707,14 @@ class KeyhostView(discord.ui.View):
             await interaction.response.send_message("先に /set_key_target を設定してね（一般通知先）。")
             return
 
-        # 画像生成や送信で3秒を超えることがあるため先にdefer（Unknown interaction回避）
+        # 先にACK（アプリの「考え中...」を残さない）
         try:
-            await interaction.response.defer(thinking=True)
+            await interaction.response.defer(thinking=False)
         except Exception:
             pass
 
         dep_candidate = now_jst() + timedelta(minutes=2)
-        # 確定時間は予定時間より早まらない（確定が早い場合は予定を採用）
+        # 仕様：確定が早い場合は予定を採用（前倒ししない）
         dep = dep_candidate
         if STATE.planned_departure:
             try:
@@ -2552,93 +2723,144 @@ class KeyhostView(discord.ui.View):
                     dep = planned_dt
             except Exception:
                 pass
+
         STATE.departure_time = hhmm(dep)
         STATE.phase = "DEPART_CONFIRMED"
         save_state(STATE)
+
+        # ボタン連打/再操作防止：押されたメッセージのボタンを外す
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
 
         await schedule_delete_after_departure()
 
         guild = interaction.guild
         assert guild is not None
 
-        # 一般：画像B（確定＋注記）
+        # ---------- 一般向け（キー配布チャンネル）：確定画像 or フォールバック ----------
         key_ch = guild.get_channel(STATE.key_channel_id)
         if not isinstance(key_ch, (discord.TextChannel, discord.Thread)):
             try:
-                await interaction.followup.send("キー配布チャンネルIDが不正です。/set_key_target をやり直して。")
+                await interaction.followup.send("キー配布チャンネルIDが不正です。/set_key_target をやり直して。", ephemeral=True)
             except Exception:
                 pass
             return
 
-        note_players = ("今一度、匿名解除の確認をお願いします" if STATE.match_no == 1 else "GoLive配信は再開されていますか？")
-        # 一般向け画像は「予定→確定」の両方を出す（予定はSTATE.planned_departure）
-        imgB = await try_render_png(
-            STATE.match_no,
-            STATE.custom_key,
-            "出発時間",
-            STATE.departure_time,
-            note_players,
-            variant="general",
-            planned_time=STATE.planned_departure)
-        if imgB:
-            msg_general = await key_ch.send(file=discord.File(imgB))
-        else:
-            msg_general = await key_ch.send(
-                f"⚔ 第{STATE.match_no}試合目\n🕒出発時間: {STATE.departure_time}\n\n{note_players}"
+        imgB = None
+        errB = None
+        try:
+            # 画像生成がハングした場合の保険（Playwright起動など）
+            imgB = await asyncio.wait_for(
+                try_render_png(
+                    STATE.match_no,
+                    STATE.custom_key,
+                    "出発時間",
+                    STATE.departure_time,
+                    None,
+                    variant="general",
+                    planned_time=STATE.planned_departure,
+                ),
+                timeout=25,
             )
-        STATE.last_key_image_msg_id = msg_general.id
+        except Exception as e:
+            errB = e
+            imgB = None
+
+        if imgB:
+            try:
+                msg_general = await key_ch.send(file=discord.File(str(imgB)))
+            except Exception as e:
+                errB = e
+                msg_general = await key_ch.send(f"【画像送信失敗】出発時間: {STATE.departure_time}")
+        else:
+            msg_general = await key_ch.send(f"【画像生成失敗】出発時間: {STATE.departure_time}")
+
+        STATE.last_key_image_msg_id = getattr(msg_general, "id", None)
         save_state(STATE)
 
-        # キーホスト：画像A'（確定版：注記あり、一般Bと完全一致させない）
+        if errB and "_send_ops_notify" in globals():
+            try:
+                await _send_ops_notify(guild, f"⚠ 画像生成/送信に失敗しました（一般向け）: {type(errB).__name__}: {errB}")
+            except Exception:
+                pass
+
+        # ---------- キーホスト向け：確定画像 or embed フォールバック ----------
         kh_ch = None
         if STATE.keyhost_channel_id:
             kh_ch = guild.get_channel(STATE.keyhost_channel_id)
 
+        imgA = None
+        errA = None
         if isinstance(kh_ch, (discord.TextChannel, discord.Thread)):
-            if STATE.last_keyhost_image_msg_id:
+            try:
+                imgA = await asyncio.wait_for(
+                    try_render_png(
+                        STATE.match_no,
+                        STATE.custom_key,
+                        "出発時間",
+                        STATE.departure_time,
+                        None,
+                        variant="keyhost_confirmed",
+                        planned_time=STATE.planned_departure,
+                    ),
+                    timeout=25,
+                )
+            except Exception as e:
+                errA = e
+                imgA = None
+
+            if imgA:
                 try:
-                    old = await kh_ch.fetch_message(STATE.last_keyhost_image_msg_id)
-                    await old.delete()
+                    edited = False
+                    # 既存の「キーホスト向け画像（予定）」メッセージを差し替える（これが要件）
+                    if STATE.last_keyhost_image_msg_id:
+                        try:
+                            target_msg = await kh_ch.fetch_message(int(STATE.last_keyhost_image_msg_id))
+                            try:
+                                # discord.py のバージョン差分対策（files / file）
+                                await target_msg.edit(attachments=[], files=[discord.File(str(imgA))])
+                            except TypeError:
+                                await target_msg.edit(attachments=[], file=discord.File(str(imgA)))
+                            edited = True
+                        except Exception:
+                            edited = False
+
+                    # 取れなかった/編集できなかった場合は新規送信にフォールバック
+                    if not edited:
+                        msg = await kh_ch.send(file=discord.File(str(imgA)))
+                        STATE.last_keyhost_image_msg_id = getattr(msg, "id", None)
+                    save_state(STATE)
+                except Exception as e:
+                    errA = e
+                    try:
+                        await kh_ch.send(embed=_make_time_embed(STATE.departure_time))
+                    except Exception:
+                        pass
+            else:
+                try:
+                    await kh_ch.send(embed=_make_time_embed(STATE.departure_time))
                 except Exception:
                     pass
 
-            note_keyhost_confirmed = "出発時間を確定しました。定刻で出発してください。"
-            imgA_confirm = await try_render_png(
-                STATE.match_no,
-                STATE.custom_key,
-                "出発時間",
-                STATE.departure_time,
-                note_keyhost_confirmed,
-                variant="keyhost_confirmed",
-                planned_time=STATE.planned_departure
-            )
-            if imgA_confirm:
+            if errA and "_send_ops_notify" in globals():
+                try:
+                    await _send_ops_notify(guild, f"⚠ 画像生成/送信に失敗しました（キーホスト）: {type(errA).__name__}: {errA}")
+                except Exception:
+                    pass
 
-                new_msg = await kh_ch.send(file=discord.File(imgA_confirm))
-
-            else:
-
-                await kh_ch.send("🚍出発時間が確定しました")
-
-                await kh_ch.send(embed=_make_time_embed(STATE.departure_time))
-
-                await kh_ch.send("定刻で出発してください")
-
-                new_msg = None
-
-            STATE.last_keyhost_image_msg_id = (new_msg.id if new_msg else STATE.last_keyhost_image_msg_id)
-            save_state(STATE)
-
+        # ---------- パネル更新 ----------
         try:
-            await interaction.followup.send(f"OK：出発時間を **{STATE.departure_time}** に確定しました。")
+            await update_ops_panel_guild(guild)
         except Exception:
-            try:
-                await interaction.channel.send(f"出発時間を {STATE.departure_time} に確定しました。")
-            except Exception:
-                pass
-        await update_ops_panel(interaction)
+            pass
 
-
+        # ---------- 最後にinteractionを完了（チャンネルには出さない） ----------
+        try:
+            await interaction.followup.send("OK", ephemeral=True)
+        except Exception:
+            pass
 async def post_ops_panel(interaction: discord.Interaction) -> None:
     """/keydrop_panel の設置（新規投稿を最小化して、'使用しました' を出さない運用用）。
     - 既存パネルがあれば edit
@@ -2722,10 +2944,26 @@ async def debug_keyhost_send(interaction: discord.Interaction):
 async def keydrop_panel(interaction: discord.Interaction):
     # コマンド使用ログ（「◯◯が /keydrop_panel を使用しました」）を出さないため、まずephemeralでdefer。
     try:
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
     except Exception:
-        pass
-    await post_ops_panel(interaction)
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+    try:
+        await post_ops_panel(interaction)
+        # 「考え中…」を残さないため、必ず応答を返す
+        try:
+            await interaction.followup.send("OK：運営パネルを設置しました。", ephemeral=True)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            await interaction.followup.send("エラー：運営パネルの設置に失敗しました。", ephemeral=True)
+        except Exception:
+            pass
+
 
 
 # @bot.tree.command(name="set_key_channel", description="キー配布チャンネルを設定（一般参加者が見る）")
@@ -2912,7 +3150,7 @@ async def set_tournament(
             STATE.match_no = STATE.match_count
 
     if match1_start:
-        v = parse_hhmm(match1_start)
+        v = parse_hhmm_str(match1_start)
         if not v:
             await interaction.response.send_message("match1_start は HH:MM（例 22:15）で。")
             return
@@ -2920,7 +3158,7 @@ async def set_tournament(
 
     save_state(STATE)
     await interaction.response.send_message("OK：大会設定を更新しました。")
-    await update_ops_panel(interaction)
+    await update_ops_panel_guild(interaction.guild)
 
 
 # @bot.tree.command(name="mark_checkin", description="【運営】チェックイン済みに番号を追加（デバッグ/補正用）")
@@ -2934,14 +3172,14 @@ async def mark_checkin(interaction: discord.Interaction, number: str):
         STATE.checked_in_numbers.append(n)
         STATE.checked_in_numbers = sorted(set(STATE.checked_in_numbers))
         save_state(STATE)
-    await update_ops_panel(interaction)
+    await update_ops_panel_guild(interaction.guild)
     await interaction.response.send_message(f"OK：{n} をチェックイン済みに追加しました。")
 
 # @bot.tree.command(name="set_map_remaining", description="【運営】リロード用マップ切替の残り時間（分）を入力して停止時間帯を算出")
 # @app_commands.checks.has_permissions(administrator=True)
 async def set_map_remaining(interaction: discord.Interaction, minutes: int):
     apply_map_remaining_minutes(now_jst(), int(minutes))
-    await update_ops_panel(interaction)
+    await update_ops_panel_guild(interaction.guild)
     await interaction.response.send_message("OK：残り時間を反映しました。")
 
 # @bot.tree.command(name="reset_tournament_defaults", description="大会設定をデフォルトに戻す（例外解除）")
@@ -2952,7 +3190,7 @@ async def reset_tournament_defaults(interaction: discord.Interaction):
     STATE.match1_start = DEFAULT_MATCH1_START
     save_state(STATE)
     await interaction.response.send_message("OK：大会設定をデフォルトに戻しました。")
-    await update_ops_panel(interaction)
+    await update_ops_panel_guild(interaction.guild)
 
 
 CHECKIN_PRE_HHMM = "21:55"
@@ -2960,6 +3198,7 @@ CHECKIN_CLOSE_HHMM = "21:58"
 AUTO_KEYHOST_HHMM = "22:00"
 
 automation_loop_task: Optional[asyncio.Task] = None
+match2_break_task: Optional[asyncio.Task] = None  # match2 replay submitted -> schedule match3 keyhost
 
 async def send_to_key_channel(guild: discord.Guild, content: str) -> None:
     if not STATE.key_channel_id:
@@ -2975,6 +3214,77 @@ async def send_to_key_channel(guild: discord.Guild, content: str) -> None:
             await ch.send(content)
         except Exception:
             pass
+
+async def schedule_match3_break_after_match2_replay(guild: discord.Guild) -> None:
+    """When match2 replay is submitted, announce in fixed key channel and deliver match3 keyhost in 5 minutes."""
+    global match2_break_task
+
+    now = now_jst()
+    notify_time = now + timedelta(minutes=5)
+    notify_hhmm = notify_time.strftime("%H:%M")
+
+    # 1) announce to fixed key channel (as requested)
+    try:
+        ch = guild.get_channel(KEY_CHANNEL_FIXED_ID)
+        if ch is None:
+            ch = await bot.fetch_channel(KEY_CHANNEL_FIXED_ID)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            await ch.send(
+                "3試合目のキー配布開始予定時刻を\n"
+                f"{notify_hhmm}といたします。\n"
+                "この間にお手洗い等をお済ませになってください。"
+            )
+    except Exception:
+        pass
+
+    # 2) update state for match3 planned departure (do not trigger immediate distribution)
+    try:
+        STATE.match_no = 3
+    except Exception:
+        pass
+    STATE.planned_departure = notify_hhmm
+    STATE.departure_time = None
+    STATE.phase = "PREP"
+    # clear any pending immediate trigger to avoid double-send
+    try:
+        setattr(STATE, "pending_next_match_no", None)
+        setattr(STATE, "pending_keyhost_send", False)
+        setattr(STATE, "pending_keyhost_send_at", None)
+    except Exception:
+        pass
+    save_state(STATE)
+
+    # 3) schedule keyhost distribution at notify_time
+    if match2_break_task and not match2_break_task.done():
+        try:
+            match2_break_task.cancel()
+        except Exception:
+            pass
+
+    async def _deliver():
+        # sleep precise until notify_time
+        try:
+            delay = max(0.0, (notify_time - now_jst()).total_seconds())
+        except Exception:
+            delay = 300.0
+        try:
+            await asyncio.sleep(delay)
+        except Exception:
+            return
+        # safety checks
+        if bool(getattr(STATE, "emergency_stop", False)):
+            return
+        try:
+            if int(getattr(STATE, "match_no", 0) or 0) != 3:
+                return
+        except Exception:
+            return
+        try:
+            await keyhost_notify_once(guild, reason="auto_break_m3")
+        except Exception:
+            pass
+
+    match2_break_task = asyncio.create_task(_deliver())
 
 async def keyhost_notify_once(guild: discord.Guild, *, reason: str = "auto") -> bool:
     # キーホスト通知（緊急停止時の手動配布を含む）
@@ -3033,6 +3343,20 @@ async def keyhost_notify_once(guild: discord.Guild, *, reason: str = "auto") -> 
         if planned in ("", "00:00"):
             # 予定が無い場合は「今+3分」を暫定予定にする
             planned = (now_jst() + timedelta(minutes=3)).strftime("%H:%M")
+        # 仕様: 1試合目のキー配布予定は大会開始時間。
+        # ただし、その時刻がキー配布停止時間帯に入る場合は「停止終了時刻」に繰り下げる。
+        try:
+            if int(getattr(STATE, "match_no", 1) or 1) == 1:
+                t0 = load_entry_tournament_start_time()
+                if planned == t0 and STATE.key_pause_from and STATE.key_pause_to:
+                    pdt = parse_hhmm(planned, now_jst())
+                    sdt = parse_hhmm(str(STATE.key_pause_from), pdt)
+                    edt = parse_hhmm(str(STATE.key_pause_to), pdt)
+                    if sdt <= pdt < edt:
+                        planned = str(STATE.key_pause_to)
+        except Exception:
+            pass
+
         STATE.planned_departure = planned
 
         note_keyhost = "待機列ができたら、Discordで【️待機列完成】ボタンを押してお知らせください"
@@ -3094,6 +3418,11 @@ async def keyhost_notify_once(guild: discord.Guild, *, reason: str = "auto") -> 
                 await caster_ch.send(f"⚔{STATE.match_no}試合目\n出発予定時間　{STATE.planned_departure}")
     except Exception:
         pass
+    # 成功時は『キー通知済み』を確定して二重送信を防止
+    if ok:
+        STATE.keyhost_notified_once = True
+        save_state(STATE)
+
 
     return ok
 
